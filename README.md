@@ -1,481 +1,199 @@
 # Hobot — Agentic AI Clinician Assistant
 
-Message-driven clinical agent runtime built on the **nanobot framework**. Nanobot provides channels, message bus, sessions, agent loop, MCP tools, providers, cron, and sub-agents out of the box. Hobot adds clinical safety, PHI protection, structured medical memory, and domain-specific MCP tool servers on top.
+Conversational clinical agent that unifies eight hospital systems behind a single chat API. Clinicians ask questions in natural language; Hobot queries EHR, vitals, labs, imaging, pharmacy, blood bank, ERP, and patient services, then returns a synthesized answer.
+
+Built on a custom **nanobot gateway** (FastAPI) that orchestrates MCP tool servers, enforces clinical safety gates, extracts structured medical facts, and logs every action to an immutable audit trail.
 
 ---
 
-## Table of Contents
+## Prerequisites
 
-- [Background](#background)
-- [Requirements](#requirements)
-- [Architecture Overview](#architecture-overview)
-- [What Nanobot Provides](#what-nanobot-provides)
-- [What Hobot Builds On Top](#what-hobot-builds-on-top)
-  - [Clinical Safety Middleware](#clinical-safety-middleware)
-  - [PHI-Aware Provider Routing](#phi-aware-provider-routing)
-  - [Response Formatter](#response-formatter)
-  - [MCP Tool Servers](#mcp-tool-servers)
-  - [Human Escalation Tool](#human-escalation-tool)
-  - [Audit Database](#audit-database)
-  - [Clinical Memory](#clinical-memory)
-- [Docker Compose Architecture](#docker-compose-architecture)
-- [Configuration](#configuration)
-- [Workflows](#workflows)
-- [Observability](#observability)
-- [Multi-Tenancy Model](#multi-tenancy-model)
+| Dependency | Version | Notes |
+|------------|---------|-------|
+| Docker + Docker Compose | 24.0+ | Compose V2 (built-in `docker compose`) |
+| NVIDIA Container Toolkit | latest | GPU passthrough for Ollama |
+| NVIDIA GPU | 6+ GB VRAM | RTX 4050 or better |
+
+No host Python install required — everything runs in containers.
 
 ---
 
-## Background
-
-### Hospital Systems Landscape
-
-A hospital generates and stores patient data across many siloed systems:
-
-| System | What It Stores |
-|--------|---------------|
-| **Patient Monitoring** | Real-time vitals — heart rate, BP, SpO2, ECG — from bedside devices |
-| **EHR / HIS** | Patient registration, clinical history, doctor notes, diagnoses |
-| **LIS** (Lab Information System) | Lab orders and test results |
-| **PACS / Radiology** | Imaging — X-ray, ultrasound, CT, MRI |
-| **ERP** | Hospital inventory and medical equipment |
-| **Blood Bank** | Blood availability and donor information |
-
-### The Problem
-
-These systems **do not talk to each other**. Clinicians must:
-
-- Log into multiple applications to get the full picture of a patient.
-- Mentally stitch together data from different screens.
-- Waste time navigating systems instead of treating patients.
-- Risk missing critical information scattered across silos.
-
-There is **no unified view of the patient**.
-
-### What Hobot Does
-
-Hobot is an agentic AI assistant that sits in front of these systems and gives clinicians a single conversational interface. Ask a question in natural language — get a unified answer drawn from EHR, vitals, labs, and imaging.
-
-Specifically, Hobot can:
-
-1. **Query patient data** — vitals, labs, medications, imaging — across EHR, monitoring, and radiology systems via MCP tool servers.
-2. **Enforce safety** — critical actions (Code Blue, EHR writes) require explicit clinician confirmation before execution.
-3. **Protect PHI** — patient data never leaves the local network unless the provider has a BAA in place.
-4. **Maintain clinical memory** — structured medical facts are never silently lost to context window summarization.
-5. **Work across channels** — clinicians use Telegram, Slack, WebChat, and others. The agent adapts output format per channel.
-6. **Degrade gracefully** — when backends are down, serve cached data with clear staleness warnings.
-7. **Audit everything** — every tool call, confirmation, escalation, and LLM request is logged immutably.
-
-Hobot extends the nanobot framework rather than wrapping it. Nanobot handles messaging infrastructure; Hobot adds clinical domain logic.
-
----
-
-## Requirements
-
-### Hardware
-
-| Component | Minimum |
-|-----------|---------|
-| GPU | NVIDIA RTX 4050 (~6 GB VRAM) |
-| RAM | 16 GB |
-| Storage | 50 GB (models + synthetic data) |
-
-### Software
-
-| Dependency | Version |
-|------------|---------|
-| Docker + Docker Compose | 24.0+ |
-| NVIDIA Container Toolkit | For GPU passthrough to Ollama |
-| Python | 3.11+ (for MCP tool servers) |
-
-### Models
-
-| Model | Use Case | VRAM |
-|-------|----------|------|
-| `llama3.2-vision` (11B) | Primary — general reasoning + vision | ~6 GB |
-| MedGemma (when available) | Clinical domain fine-tune from Google | TBD |
-| `llama3.1:70b` | **Not viable** on RTX 4050 — skipped | ~40 GB |
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Docker Compose                           │
-│                                                                 │
-│  ┌──────────────┐   ┌─────────┐   ┌──────────────────────────┐ │
-│  │  Channels     │   │  Ollama │   │  MCP Tool Servers        │ │
-│  │  (Telegram,   │   │  (GPU)  │   │  ┌────────┐ ┌────────┐  │ │
-│  │   Slack,      │◄─►│         │   │  │mcp-ehr │ │mcp-mon │  │ │
-│  │   WebChat...) │   └────▲────┘   │  └───▲────┘ └───▲────┘  │ │
-│  └──────┬───────┘        │        │  ┌───┴────┐      │       │ │
-│         │                │        │  │mcp-rad │      │       │ │
-│         ▼                │        │  └───▲────┘      │       │ │
-│  ┌──────────────────────────┐     │      │           │       │ │
-│  │     Nanobot Gateway      │     └──────┼───────────┼───────┘ │
-│  │  ┌────────────────────┐  │            │           │         │
-│  │  │ Clinical Safety    │  │◄───────────┴───────────┘         │
-│  │  │ Middleware         │  │                                   │
-│  │  │  • Pre-exec guard  │  │     ┌──────────────────────────┐ │
-│  │  │  • Post-exec audit │  │     │  Synthetic Backends      │ │
-│  │  │  • PHI redaction   │  │     │  ┌──────┐ ┌─────┐       │ │
-│  │  └────────────────────┘  │     │  │ HAPI │ │Orth-│       │ │
-│  │  ┌────────────────────┐  │     │  │ FHIR │ │anc  │       │ │
-│  │  │ Response Formatter │  │     │  └──────┘ └─────┘       │ │
-│  │  └────────────────────┘  │     │  ┌──────────────┐       │ │
-│  │  ┌────────────────────┐  │     │  │ Synth Vitals │       │ │
-│  │  │ Clinical Memory    │  │     │  └──────────────┘       │ │
-│  │  └────────────────────┘  │     └──────────────────────────┘ │
-│  └──────────┬───────────────┘                                   │
-│             │                                                   │
-│             ▼                                                   │
-│  ┌──────────────────┐                                           │
-│  │  SQLite Audit DB  │  (+ SQLite Web UI on :8081)              │
-│  │  • audit_log      │                                          │
-│  │  • escalations    │                                          │
-│  │  • clinical_facts │                                          │
-│  └──────────────────┘                                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**8 containers total.** Swap synthetic backends for real ones in production by changing env vars.
-
----
-
-## What Nanobot Provides
-
-These are **not custom-built** — they come from the nanobot framework:
-
-| Concern | Nanobot Module |
-|---------|---------------|
-| Channel adapters | Telegram, Discord, Slack, Matrix, Email, WhatsApp, QQ, DingTalk, Feishu |
-| Message bus | `bus/queue.py` — async inbound/outbound queues |
-| Session management | `session/manager.py` — JSONL append-only, in-memory cache |
-| Agent loop | `agent/loop.py` — up to 40 iterations, tool calls, streaming |
-| Memory | `agent/memory.py` — consolidation, configurable window |
-| MCP tools | `agent/tools/mcp.py` — native MCP integration |
-| Provider abstraction | `providers/` — OpenAI-compatible, LiteLLM, custom |
-| Cron/scheduling | `cron/service.py` |
-| Sub-agents | `agent/subagent.py` |
-| Context assembly | `agent/context.py` — ContextBuilder |
-| Heartbeat | `heartbeat/service.py` |
-| Channel permissions | Allowlist-based sender validation |
-
-**Key decision:** Use `nanobot gateway` directly. Extend, don't wrap.
-
----
-
-## What Hobot Builds On Top
-
-### Clinical Safety Middleware
-
-Hooks into nanobot's `ToolRegistry` at three points:
-
-**Pre-execution guard:**
-- Tools classified as `critical` (EHR writes, Code Blue, escalation) require explicit clinician confirmation via the channel before execution.
-- Non-critical tools execute immediately.
-
-**Post-execution audit:**
-- Every tool call writes an immutable record to SQLite: timestamp, user, tool, params hash, result summary, confirmation ID, template version.
-
-**Pre-LLM PHI redaction:**
-- If the selected provider is not `phi_safe`, PHI patterns (UHID, patient names, DOB) are redacted before sending to the model.
-- Original values re-injected into the response after inference.
-
-### PHI-Aware Provider Routing
-
-| Provider | Location | PHI Safe | Use Case |
-|----------|----------|----------|----------|
-| Ollama | Local | Yes | Default for all clinical tasks |
-| Cloud (Anthropic, OpenAI) | Remote | No | Opt-in, non-PHI tasks only, or with BAA |
-
-- Default model: `llama3.2-vision` via Ollama (11B, fits RTX 4050).
-- Cloud providers tagged `phi_safe: false`. PHI redaction middleware activates automatically when routing to them.
-
-### Response Formatter
-
-Sits in the outbound path between agent and channel `send()`:
-
-- Each channel declares capabilities: `{ rich_text, buttons, tables, images, max_msg_length }`.
-- Formatter downgrades output to match:
-  - Tables → plain text lists (for text-only channels)
-  - Images → links (for channels without inline image support)
-  - Long messages → paginated
-- Critical alerts (Code Blue) get channel-appropriate formatting:
-  - Text-only: **BOLD/CAPS**
-  - WebChat: red banner with high-priority styling
-
-### MCP Tool Servers
-
-Three microservices, each running in its own Docker container:
-
-| Service | Protocol | Backend | Reference |
-|---------|----------|---------|-----------|
-| `mcp-ehr` | FHIR R4 | HAPI FHIR (synthetic) → real EHR | Based on [wso2/fhir-mcp-server](https://github.com/wso2/fhir-mcp-server) |
-| `mcp-monitoring` | Custom | Synthetic → real vitals feeds | Custom — no upstream reference |
-| `mcp-radiology` | DICOM/DICOMweb | Orthanc (synthetic) → real PACS | Based on [ChristianHinge/dicom-mcp](https://github.com/ChristianHinge/dicom-mcp) |
-
-**What each server does:**
-
-- **`mcp-ehr`** — Patient demographics, medications, allergies, labs, orders. Includes patient consent check. Wraps a FHIR R4 endpoint; the WSO2 FHIR MCP server provides a ready-made starting point.
-- **`mcp-monitoring`** — Real-time and historical vital signs (HR, BP, SpO2, temp). Custom service against synthetic vitals generator in Phase 1.
-- **`mcp-radiology`** — Imaging studies, reports, DICOM viewer URLs. Backed by Orthanc in Phase 1; the synthetic service models the [Orthanc REST API](https://orthanc.uclouvain.be/book/users/rest-cheatsheet.html). The `dicom-mcp` project provides the MCP-to-DICOM bridge.
-
-**Common traits** across all MCP servers:
-
-- Health endpoint (`GET /health`).
-- `degraded_mode`: returns cached/stale data with a staleness indicator when the backend is unreachable.
-- Tool result truncation: shows error if nanobot's 500-char limit is hit (increase limit in config).
-
-### Human Escalation Tool
-
-Custom MCP tool `escalate`:
-
-1. Notifies designated on-call clinician via configured channel.
-2. Pauses the agent loop, awaits human response.
-3. Logs escalation in audit trail (both `audit_log` and `escalations` tables).
-
-**Triggered by:**
-- Agent uncertainty (low-confidence clinical decision)
-- Critical findings (abnormal imaging, dangerous vitals)
-- Patient safety concerns (drug interactions, allergy alerts)
-
-### Audit Database
-
-**Phase 1:** SQLite — single file, zero config, ACID-compliant, WAL mode for concurrent reads.
-**Phase 2:** Migrate to PostgreSQL when scaling to multi-node.
-
-#### Schema
-
-```sql
--- Immutable log of every action
-CREATE TABLE audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id TEXT NOT NULL,
-    timestamp TEXT NOT NULL,          -- ISO 8601
-    session_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    channel TEXT NOT NULL,
-    action TEXT NOT NULL,             -- tool_call, confirmation, escalation, llm_request
-    tool_name TEXT,
-    params_hash TEXT,                 -- SHA256 of params (not raw PHI)
-    result_summary TEXT,
-    confirmation_id TEXT,
-    template_version TEXT,
-    provider TEXT,
-    model TEXT,
-    latency_ms INTEGER
-);
-
--- Escalation tracking
-CREATE TABLE escalations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id TEXT NOT NULL,
-    audit_log_id INTEGER REFERENCES audit_log(id),
-    escalated_to TEXT NOT NULL,
-    reason TEXT,
-    resolved_at TEXT,
-    resolved_by TEXT,
-    resolution TEXT
-);
-```
-
-#### Backup Strategy
-
-- SQLite WAL mode enabled for concurrent read access.
-- Periodic backup to object storage (S3/MinIO).
-- Backups are append-only — never delete old backups within retention window.
-
-### Clinical Memory
-
-**Problem:** Nanobot's memory consolidation summarizes old context (lossy). Clinical data must not be silently lost.
-
-**Solution — Dual-layer memory:**
-
-| Layer | Store | Lossy? | Purpose |
-|-------|-------|--------|---------|
-| Conversational | Nanobot default (JSONL + consolidation) | Yes | Chat continuity. Summarization is acceptable. |
-| Clinical | SQLite `clinical_facts` table | No | Structured medical facts. Never summarized, never discarded. |
-
-#### Schema
-
-```sql
-CREATE TABLE clinical_facts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    tenant_id TEXT NOT NULL,
-    patient_id TEXT NOT NULL,
-    fact_type TEXT NOT NULL,          -- vitals, diagnosis, medication, lab_result, allergy, note
-    fact_data TEXT NOT NULL,          -- JSON
-    source_tool TEXT,                 -- which MCP tool provided this
-    recorded_at TEXT NOT NULL,
-    expires_at TEXT                   -- NULL = permanent
-);
-```
-
-#### How It Works
-
-1. **Post-tool-execution hook** extracts structured clinical facts from tool results.
-2. Facts stored in `clinical_facts` table immediately.
-3. On session resume, agent context includes: summarized conversation + **full clinical facts** for active patients.
-4. Clinician can ask "show all facts for patient X" — reads from DB, not from lossy memory.
-
-#### Edge Cases
-
-- **Long multi-patient sessions:** facts extracted per-patient before consolidation runs.
-- **Ambiguous facts:** marked `confidence: low`, flagged for clinician review.
-- **Consolidation:** only conversational context is summarized. Clinical facts are never deleted by consolidation.
-
----
-
-## Docker Compose Architecture
-
-```yaml
-services:
-  # --- Core ---
-  nanobot-gateway:
-    build: ./nanobot
-    depends_on: [ollama, mcp-ehr, mcp-monitoring, mcp-radiology, audit-db]
-    volumes:
-      - ./config:/root/.nanobot
-      - audit-data:/data/audit
-    ports:
-      - "3000:3000"    # WebChat
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - AUDIT_DB=/data/audit/clinic.db
-
-  # --- Model ---
-  ollama:
-    image: ollama/ollama
-    volumes:
-      - ollama-models:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-  # --- MCP Tool Servers ---
-  mcp-ehr:
-    build: ./mcp-ehr
-    depends_on: [synthetic-ehr]
-    environment:
-      - FHIR_BASE=http://synthetic-ehr:8080/fhir
-
-  mcp-monitoring:
-    build: ./mcp-monitoring
-    depends_on: [synthetic-monitoring]
-
-  mcp-radiology:
-    build: ./mcp-radiology
-    depends_on: [synthetic-radiology]
-
-  # --- Synthetic Backends (Phase 1) ---
-  synthetic-ehr:
-    image: hapiproject/hapi-fhir-jpaserver
-    ports: ["8080:8080"]
-
-  synthetic-monitoring:
-    build: ./synthetic-monitoring
-
-  synthetic-radiology:
-    image: orthancteam/orthanc
-    ports: ["8042:8042"]
-
-  # --- Audit DB Web UI ---
-  audit-db:
-    image: kevinmichaelchen/sqlite-web
-    volumes:
-      - audit-data:/data
-    ports: ["8081:8080"]   # SQLite web UI for debugging
-
-volumes:
-  ollama-models:
-  audit-data:
-```
-
-**8 containers.** In production, swap synthetic backends for real systems by changing environment variables.
-
-### Ports
-
-| Port | Service |
-|------|---------|
-| 3000 | Nanobot WebChat |
-| 8080 | HAPI FHIR (synthetic EHR) |
-| 8042 | Orthanc (synthetic PACS) |
-| 8081 | SQLite Web UI (audit DB) |
-
-### Getting Started
+## Quick Start
 
 ```bash
 # 1. Clone and enter repo
 git clone <repo-url> && cd hobot
 
-# 2. Pull Ollama model (first run only)
+# 2. Start Ollama and pull a model (first run only)
 docker compose up ollama -d
-docker compose exec ollama ollama pull llama3.2-vision
+docker compose exec ollama ollama pull llama3.1:8b
 
-# 3. Start all services
-docker compose up -d
+# 3. Start everything
+docker compose up -d --build
 
-# 4. Verify health
+# 4. Check gateway health (all backends should report "ok")
 curl http://localhost:3000/health
 
-# 5. Open WebChat
-open http://localhost:3000
+# 5. Send a chat message
+curl -X POST http://localhost:3000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "message": "Show vitals for P001",
+    "user_id": "doc1",
+    "channel": "webchat",
+    "tenant_id": "T1"
+  }'
 ```
+
+First `docker compose up --build` takes a few minutes to build all 18 images. Subsequent starts are fast.
+
+---
+
+## Architecture
+
+```
+                        ┌─────────────┐
+                        │   Ollama    │
+                        │  (GPU/LLM)  │
+                        └──────▲──────┘
+                               │
+┌──────────────────────────────┼──────────────────────────────────┐
+│  Nanobot Gateway (:3000)     │                                  │
+│  ┌────────────┐  ┌───────────┴──────┐  ┌────────────────────┐  │
+│  │ /chat      │→ │  Agent Loop      │→ │  Tool Dispatch     │──┼──→ Synthetic Backends
+│  │ /health    │  │  (Ollama + kw    │  │  (HTTP to backends)│  │
+│  │ /confirm   │  │   fallback)      │  └────────────────────┘  │
+│  └────────────┘  └──────────────────┘                           │
+│  ┌────────────┐  ┌──────────────────┐  ┌────────────────────┐  │
+│  │ Audit Log  │  │ Clinical Memory  │  │ Response Formatter │  │
+│  │ (SQLite)   │  │ (fact extraction)│  │ (per-channel)      │  │
+│  └────────────┘  └──────────────────┘  └────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**18 containers total:**
+
+| Layer | Containers |
+|-------|-----------|
+| Gateway | `nanobot-gateway` |
+| Model | `ollama` |
+| MCP tool servers (8) | `mcp-ehr`, `mcp-monitoring`, `mcp-radiology`, `mcp-lis`, `mcp-pharmacy`, `mcp-bloodbank`, `mcp-erp`, `mcp-patient-services` |
+| Synthetic backends (8) | `synthetic-ehr` (HAPI FHIR), `synthetic-monitoring`, `synthetic-radiology` (Orthanc), `synthetic-lis`, `synthetic-pharmacy`, `synthetic-bloodbank`, `synthetic-erp`, `synthetic-patient-services` |
+| Utilities | `audit-db` (SQLite Web UI) |
+
+---
+
+## Exposed Ports
+
+| Port | Service | Purpose |
+|------|---------|---------|
+| 3000 | nanobot-gateway | Chat API + health check |
+| 8080 | synthetic-ehr (HAPI FHIR) | FHIR R4 server |
+| 8042 | synthetic-radiology (Orthanc) | DICOM/DICOMweb viewer |
+| 8081 | audit-db (sqlite-web) | Audit log browser |
+
+---
+
+## API Reference
+
+### `POST /chat`
+
+Send a message and get a response.
+
+**Request:**
+
+```json
+{
+  "message": "Show vitals for P001",
+  "user_id": "doc1",
+  "channel": "webchat",
+  "tenant_id": "T1",
+  "session_id": null
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message` | string | yes | Natural language query |
+| `user_id` | string | yes | Clinician identifier |
+| `channel` | string | no | `webchat` (default), `telegram`, `slack` |
+| `tenant_id` | string | no | Tenant for multi-hospital. Default: `default` |
+| `session_id` | string | no | Omit to start new session; pass to continue |
+
+**Response:**
+
+```json
+{
+  "response": "**get_vitals** result:\n```json\n{...}\n```",
+  "session_id": "a1b2c3d4-..."
+}
+```
+
+Pass `session_id` back on subsequent requests to maintain conversation context and clinical memory.
+
+### `POST /confirm/{confirmation_id}`
+
+Execute a critical tool that was gated behind confirmation.
+
+When a critical tool is invoked (e.g. `initiate_code_blue`, `order_blood_crossmatch`), the gateway returns a `confirmation_id` instead of executing. POST to this endpoint to authorize execution.
+
+```bash
+curl -X POST http://localhost:3000/confirm/a1b2c3d4-...
+```
+
+### `GET /health`
+
+Returns per-backend health status.
+
+```json
+{
+  "status": "ok",
+  "service": "nanobot-gateway",
+  "backends": {
+    "synthetic-monitoring": "ok",
+    "synthetic-ehr": "ok",
+    "synthetic-lis": "ok",
+    "synthetic-pharmacy": "ok",
+    "synthetic-radiology": "ok",
+    "synthetic-bloodbank": "ok",
+    "synthetic-erp": "ok",
+    "synthetic-patient-services": "ok"
+  }
+}
+```
+
+`status` is `ok` when all backends respond, `degraded` when any are unreachable.
 
 ---
 
 ## Configuration
 
-Nanobot configuration lives in `./config/` (mounted to `/root/.nanobot` in the gateway container).
+All config files live in `config/` and are mounted into the gateway at `/app/config`.
 
-### Provider Config (`config.json`)
+### `config/tools.json` — Tool Criticality
 
-```json
-{
-  "providers": {
-    "ollama": {
-      "baseUrl": "http://ollama:11434",
-      "phi_safe": true
-    },
-    "anthropic": {
-      "apiKey": "${ANTHROPIC_API_KEY}",
-      "phi_safe": false
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": "llama3.2-vision",
-      "provider": "ollama"
-    }
-  }
-}
-```
-
-### Tool Classification
-
-Tools are classified in the MCP tool server manifests:
+Controls which tools require human confirmation before execution.
 
 ```json
 {
   "tools": {
     "initiate_code_blue": { "critical": true },
     "write_order": { "critical": true },
+    "order_blood_crossmatch": { "critical": true },
+    "dispense_medication": { "critical": true },
+    "request_ambulance": { "critical": true },
+    "order_lab": { "critical": true },
     "get_vitals": { "critical": false },
     "get_patient": { "critical": false }
   }
 }
 ```
 
-Critical tools trigger the confirmation flow before execution.
+Critical tools return a `confirmation_id` on first call. The clinician must POST `/confirm/{id}` to execute.
 
-### Channel Capabilities
+### `config/channels.json` — Channel Capabilities
+
+Controls how responses are formatted per output channel.
 
 ```json
 {
@@ -505,16 +223,22 @@ Critical tools trigger the confirmation flow before execution.
 }
 ```
 
-### Rate Limiting
+When `tables: false`, markdown tables are converted to plain text. When `max_msg_length` is set, responses are truncated.
 
-Per-clinician rate limits to prevent abuse:
+### `config/config.json` — Provider Config
 
 ```json
 {
-  "rate_limits": {
-    "per_user": {
-      "requests_per_minute": 20,
-      "requests_per_hour": 200
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://ollama:11434",
+      "phi_safe": true
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "llama3.1:8b",
+      "provider": "ollama"
     }
   }
 }
@@ -522,179 +246,207 @@ Per-clinician rate limits to prevent abuse:
 
 ---
 
-## Workflows
+## Environment Variables
 
-### Workflow 1: Patient Status Query (Routine)
+The gateway reads these from docker-compose (all have defaults):
 
-```
-Clinician (Telegram): "Show vitals for patient UHID12345"
-  → Agent detects intent: patient_vitals
-  → Clinical memory lookup: clinical_facts WHERE patient_id = 'UHID12345'
-  → Tool calls (parallel):
-      mcp-monitoring.get_vitals(patient_id="UHID12345")
-      mcp-ehr.get_patient(patient_id="UHID12345")
-  → Post-exec: extract facts → store in clinical_facts + audit log
-  → Agent synthesizes response (Ollama, local, PHI-safe)
-  → Response Formatter: Telegram markdown
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_HOST` | `http://ollama:11434` | Ollama API endpoint |
+| `OLLAMA_MODEL` | `llama3.1:8b` | Model for agent reasoning |
+| `AUDIT_DB` | `/data/audit/clinic.db` | SQLite audit database path |
+| `SCHEMA_PATH` | `/app/schema/init.sql` | SQL schema for DB init |
+| `TOOLS_CONFIG` | `/app/config/tools.json` | Tool criticality config |
+| `CHANNELS_CONFIG` | `/app/config/channels.json` | Channel formatting config |
+| `MONITORING_BASE` | `http://synthetic-monitoring:8000` | Vitals backend |
+| `EHR_BASE` | `http://synthetic-ehr:8080` | EHR/FHIR backend |
+| `LIS_BASE` | `http://synthetic-lis:8000` | Lab backend |
+| `PHARMACY_BASE` | `http://synthetic-pharmacy:8000` | Pharmacy backend |
+| `RADIOLOGY_BASE` | `http://synthetic-radiology:8042` | Radiology backend |
+| `BLOODBANK_BASE` | `http://synthetic-bloodbank:8000` | Blood bank backend |
+| `ERP_BASE` | `http://synthetic-erp:8000` | ERP/inventory backend |
+| `PATIENT_SERVICES_BASE` | `http://synthetic-patient-services:8000` | Patient services backend |
 
-**Clinician sees:**
-
-```
-**UHID12345 — John Doe, 54M**
-HR 78 | BP 120/80 | SpO2 98% | Temp 37.1°C
-Meds: Metformin 500mg, Lisinopril 10mg
-Allergies: Penicillin
-```
-
-**Latency:** ~2-4s (Ollama inference + 2 parallel MCP calls)
+To point at real hospital systems, change the `*_BASE` variables to their production URLs.
 
 ---
 
-### Workflow 2: Code Blue (Safety-Critical)
+## Available Tools
 
-```
-Clinician (Slack): "Patient UHID99887 in cardiac arrest, initiate code blue"
-  → Agent detects: code_blue (critical tool)
-  → Pre-exec: CRITICAL → confirmation required
-  → Agent: "⚠️ CONFIRM Code Blue for UHID99887 (Room 4B, Jane Smith, 67F)? Reply YES."
-  → Clinician: "YES"
-  → Confirmation logged → Code Blue initiated in EHR
-  → Parallel: get_vitals + get_patient
-  → Agent synthesizes emergency summary
-  → Escalation tool: notify on-call cardiologist
-```
+The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a direct HTTP call to the corresponding synthetic backend.
 
-**Latency target:** <5s to confirmation prompt. <3s after confirmation.
-
----
-
-### Workflow 3: Radiology Review (Multimodal)
-
-```
-Clinician (WebChat): "Show latest chest X-ray for UHID55443"
-  → mcp-radiology.get_latest_study(patient_id="UHID55443", modality="XR", body_part="chest")
-  → mcp-radiology.get_report(study_id="STU-12345")
-  → Agent synthesizes with llama3.2-vision (image analysis)
-  → Response Formatter adapts per channel:
-      WebChat: inline image + formatted report
-      Telegram: image attachment + text summary
-      Slack: image in thread + structured blocks
-```
+| Domain | Tools | Backend |
+|--------|-------|---------|
+| **Monitoring** | `get_vitals`, `get_vitals_history`, `list_wards`, `list_doctors`, `get_ward_patients`, `get_doctor_patients`, `get_patient_events`, `get_event_vitals`, `get_event_ecg`, `initiate_code_blue` | synthetic-monitoring |
+| **EHR** | `get_patient`, `get_medications`, `get_allergies`, `get_orders`, `write_order` | synthetic-ehr (HAPI FHIR) |
+| **Radiology** | `get_studies`, `get_report`, `get_latest_study` | synthetic-radiology (Orthanc) |
+| **LIS** | `get_lab_results`, `get_lab_order`, `order_lab`, `get_order_status` | synthetic-lis |
+| **Pharmacy** | `check_drug_interactions`, `dispense_medication` | synthetic-pharmacy |
+| **Blood Bank** | `get_blood_availability`, `order_blood_crossmatch`, `get_crossmatch_status` | synthetic-bloodbank |
+| **ERP** | `get_inventory`, `get_equipment_status`, `place_supply_order` | synthetic-erp |
+| **Patient Services** | `request_housekeeping`, `order_diet`, `request_ambulance`, `get_request_status` | synthetic-patient-services |
+| **Gateway** | `escalate` | nanobot (internal) |
 
 ---
 
-### Workflow 4: Degraded Mode (EHR Down)
+## Agent Modes
 
-```
-Clinician: "Medications for UHID12345"
-  → mcp-ehr.get_medications() → TIMEOUT → retry → TIMEOUT
-  → degraded_mode activated
-  → Fallback: clinical_facts WHERE patient_id='UHID12345' AND fact_type='medication'
-  → Returns cached data from 2h ago
-```
+The gateway agent operates in two modes:
 
-**Clinician sees:**
+**Ollama mode (primary):** When Ollama is reachable, the agent sends conversation context + tool definitions to the LLM. The LLM selects tools and synthesizes natural language responses from results. Supports multi-step reasoning (up to 10 iterations per request).
 
-```
-⚠️ EHR system currently unavailable.
-Showing cached medications (as of 2h ago):
-- Metformin 500mg BID
-- Lisinopril 10mg QD
-⚠️ This data may be outdated. Verify with pharmacy.
-```
+**Keyword fallback:** When Ollama is unavailable, the agent uses regex-based intent detection to map messages to tools. Tool results are returned as formatted JSON. Examples:
+- "vitals for P001" → `get_vitals(patient_id="P001")`
+- "list wards" → `list_wards()`
+- "lab results P001" → `get_lab_results(patient_id="P001")`
+- "blood availability" → `get_blood_availability()`
 
-**Audit log:** `tool_failure` + `degraded_mode_used`
+Ollama health is checked at startup and re-checked on failure.
 
 ---
 
-### Workflow 5: Multi-Patient Rounds Summary
+## Clinical Memory
+
+Every tool call result is automatically parsed into structured **clinical facts** and stored in SQLite. Facts are never summarized or discarded.
+
+Supported fact types: `vitals`, `medication`, `allergy`, `lab_result`, `lab_order`, `demographics`, `order`, `imaging_study`, `radiology_report`, `blood_inventory`, `crossmatch`.
+
+Facts are injected into the LLM context for active patients, so the agent has full clinical history without re-querying backends.
+
+---
+
+## Audit Trail
+
+Every action is logged to `schema/init.sql`-defined tables:
+
+- **`audit_log`** — immutable record of every tool call, chat response, and confirmation. Parameters are SHA-256 hashed (raw PHI never stored in audit).
+- **`escalations`** — tracks human escalation requests and resolutions.
+- **`clinical_facts`** — structured medical data extracted from tool results.
+
+Browse the audit database at `http://localhost:8081` (sqlite-web UI).
+
+---
+
+## PHI Protection
+
+When routing to a non-PHI-safe provider, the gateway activates regex-based PHI redaction:
+- Patient IDs (P001, UHID12345)
+- Dates of birth
+- Phone numbers
+
+are replaced with tokens before sending to the LLM, then restored in the response. Ollama (local) is marked `phi_safe: true` and skips redaction.
+
+---
+
+## Project Structure
 
 ```
-Clinician (WebChat): "Morning summary for my patients on Ward 3B"
-  → mcp-ehr.get_ward_patients(ward="3B", attending="DR-SMITH")
-    → Returns [UHID001, UHID002, UHID003, UHID004]
-  → Parallel fan-out (nanobot sub-agents):
-      Per patient: get_vitals + get_latest_labs + get_overnight_notes
-      4 patients × 3 tools = 12 MCP calls
-  → Clinical facts extracted and stored per patient
-  → Agent synthesizes ward summary
-```
-
-**Clinician sees:**
-
-```
-**Ward 3B Morning Rounds — 4 patients**
-
-1. UHID001 — Bed 1, John Doe, 54M
-   Overnight: stable. HR 72, BP 118/76
-   Labs: K+ 4.2 (normal), Cr 1.1 (stable)
-   Plan: continue current meds, discharge eval today
-
-2. UHID002 — Bed 3, Mary Jones, 71F
-   ⚠️ Overnight: fever spike 38.9°C at 02:00
-   Labs: WBC 14.2 (↑), CRP 45 (↑)
-   Recommend: blood cultures, consider ABx change
-   ...
+hobot/
+├── config/
+│   ├── config.json          # Provider + model config
+│   ├── tools.json           # Tool criticality flags
+│   └── channels.json        # Channel formatting capabilities
+├── schema/
+│   └── init.sql             # Audit DB schema (SQLite)
+├── nanobot/                  # Gateway (FastAPI, port 3000)
+│   ├── main.py              # App + endpoints (/chat, /health, /confirm)
+│   ├── agent.py             # Agent loop (Ollama + keyword fallback)
+│   ├── tools.py             # Tool registry + HTTP dispatch + critical gate
+│   ├── audit.py             # SQLite audit logging
+│   ├── clinical_memory.py   # Fact extraction + storage
+│   ├── session.py           # In-memory session manager
+│   ├── formatter.py         # Channel-aware response formatting
+│   ├── phi.py               # PHI redaction/restoration
+│   ├── Dockerfile
+│   └── requirements.txt
+├── mcp-*/                    # MCP tool servers (8 services)
+│   ├── server.py            # FastMCP stdio server + health endpoint
+│   ├── Dockerfile
+│   └── requirements.txt
+├── synthetic-*/              # Synthetic backends (8 services)
+│   ├── main.py              # FastAPI REST API with in-memory data
+│   ├── Dockerfile
+│   └── requirements.txt
+└── docker-compose.yml        # Full stack orchestration
 ```
 
 ---
 
-## Observability
+## Operations
 
-### Structured Logging
+### Start / Stop
 
-All components emit structured JSON logs. Key fields: `timestamp`, `service`, `level`, `message`, `tenant_id`, `session_id`.
+```bash
+# Start everything
+docker compose up -d --build
 
-### Key Metrics
+# Stop everything (data persisted in volumes)
+docker compose down
 
-Emitted to logs, scrapeable by Prometheus:
-
-| Metric | Description |
-|--------|-------------|
-| `agent.response_latency_ms` | p50, p95 response time |
-| `tool.call_count` | By tool name |
-| `tool.failure_rate` | By tool name |
-| `provider.fallback_count` | Cloud fallback events |
-| `escalation.count` | Human escalation events |
-
-### Health Endpoint
-
-```
-GET /health → {
-  "status": "healthy",
-  "ollama": "ok",
-  "mcp_ehr": "ok",
-  "mcp_monitoring": "ok",
-  "mcp_radiology": "ok",
-  "audit_db": "ok"
-}
+# Stop and delete all data
+docker compose down -v
 ```
 
-Returns `degraded` if any MCP tool server is down (agent still functional via cached data).
+### Logs
 
-### Docker Healthchecks
+```bash
+# Gateway logs
+docker compose logs -f nanobot-gateway
 
-All containers define healthchecks. `docker compose ps` shows health status at a glance.
+# All logs
+docker compose logs -f
+
+# Specific service
+docker compose logs -f synthetic-monitoring
+```
+
+### Rebuild a single service
+
+```bash
+docker compose build mcp-bloodbank
+docker compose up -d mcp-bloodbank
+```
+
+### Change the Ollama model
+
+```bash
+docker compose exec ollama ollama pull llama3.2-vision
+# Then set OLLAMA_MODEL=llama3.2-vision in docker-compose.yml and restart:
+docker compose up -d nanobot-gateway
+```
+
+### Inspect audit database
+
+Open `http://localhost:8081` in a browser, or query directly:
+
+```bash
+docker compose exec audit-db sqlite3 /data/clinic.db "SELECT * FROM audit_log ORDER BY id DESC LIMIT 10;"
+```
 
 ---
 
-## Multi-Tenancy Model
+## Swapping Synthetic Backends for Real Systems
 
-Hobot supports multi-hospital deployment:
+Each backend URL is configured via environment variable. To connect to a real hospital EHR:
 
-- **`tenant_id`** on all database tables (`audit_log`, `escalations`, `clinical_facts`).
-- **Network isolation** per tenant via Docker networks — tenants cannot reach each other's MCP backends.
-- **Provider config** per tenant — one hospital may use local Ollama only, another may opt into cloud with BAA.
-- **Rate limits** scoped per tenant + per clinician.
-- **Audit logs** queryable per tenant. No cross-tenant data leakage.
+```yaml
+# docker-compose.yml
+nanobot-gateway:
+  environment:
+    - EHR_BASE=https://real-ehr.hospital.local/fhir
+```
 
-### Adding a New Tenant
+Remove the corresponding `synthetic-*` service and its `mcp-*` dependency. The gateway calls backends directly, so MCP servers are only needed for external MCP clients.
 
-1. Create tenant entry in config.
-2. Provision Docker network for tenant's MCP backends.
-3. Configure channel allowlists (which clinician IDs can interact).
-4. Deploy tenant-specific MCP tool servers (or share with network isolation).
+---
+
+## Volumes
+
+| Volume | Mounted On | Purpose |
+|--------|-----------|---------|
+| `ollama-models` | ollama `/root/.ollama` | Persists downloaded LLM models |
+| `audit-data` | nanobot-gateway `/data/audit`, audit-db `/data` | SQLite audit + clinical facts DB |
+| `hdf5-data` | synthetic-monitoring `/data/hdf5` | Persists HDF5 vitals data across restarts |
 
 ---
 
