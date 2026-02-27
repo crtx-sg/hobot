@@ -28,17 +28,45 @@ Message-driven clinical agent runtime built on the **nanobot framework**. Nanobo
 
 ## Background
 
-Clinical environments need AI assistants that can:
+### Hospital Systems Landscape
 
-1. **Query patient data** — vitals, labs, medications, imaging — across EHR, monitoring, and radiology systems.
+A hospital generates and stores patient data across many siloed systems:
+
+| System | What It Stores |
+|--------|---------------|
+| **Patient Monitoring** | Real-time vitals — heart rate, BP, SpO2, ECG — from bedside devices |
+| **EHR / HIS** | Patient registration, clinical history, doctor notes, diagnoses |
+| **LIS** (Lab Information System) | Lab orders and test results |
+| **PACS / Radiology** | Imaging — X-ray, ultrasound, CT, MRI |
+| **ERP** | Hospital inventory and medical equipment |
+| **Blood Bank** | Blood availability and donor information |
+
+### The Problem
+
+These systems **do not talk to each other**. Clinicians must:
+
+- Log into multiple applications to get the full picture of a patient.
+- Mentally stitch together data from different screens.
+- Waste time navigating systems instead of treating patients.
+- Risk missing critical information scattered across silos.
+
+There is **no unified view of the patient**.
+
+### What Hobot Does
+
+Hobot is an agentic AI assistant that sits in front of these systems and gives clinicians a single conversational interface. Ask a question in natural language — get a unified answer drawn from EHR, vitals, labs, and imaging.
+
+Specifically, Hobot can:
+
+1. **Query patient data** — vitals, labs, medications, imaging — across EHR, monitoring, and radiology systems via MCP tool servers.
 2. **Enforce safety** — critical actions (Code Blue, EHR writes) require explicit clinician confirmation before execution.
 3. **Protect PHI** — patient data never leaves the local network unless the provider has a BAA in place.
-4. **Maintain clinical memory** — structured medical facts must never be silently lost to context window summarization.
-5. **Work across channels** — clinicians use Telegram, Slack, WebChat, and others. The agent must adapt output format per channel.
+4. **Maintain clinical memory** — structured medical facts are never silently lost to context window summarization.
+5. **Work across channels** — clinicians use Telegram, Slack, WebChat, and others. The agent adapts output format per channel.
 6. **Degrade gracefully** — when backends are down, serve cached data with clear staleness warnings.
 7. **Audit everything** — every tool call, confirmation, escalation, and LLM request is logged immutably.
 
-Hobot achieves this by extending nanobot rather than wrapping it. Nanobot handles messaging infrastructure; Hobot adds clinical domain logic.
+Hobot extends the nanobot framework rather than wrapping it. Nanobot handles messaging infrastructure; Hobot adds clinical domain logic.
 
 ---
 
@@ -182,15 +210,22 @@ Sits in the outbound path between agent and channel `send()`:
 
 Three microservices, each running in its own Docker container:
 
-| Service | Protocol | Backend | Description |
-|---------|----------|---------|-------------|
-| `mcp-ehr` | FHIR R4 | HAPI FHIR (synthetic) → real EHR | Patient demographics, medications, allergies, labs, orders. Includes patient consent check. |
-| `mcp-monitoring` | Custom | Synthetic → real vitals feeds | Real-time and historical vital signs (HR, BP, SpO2, temp). |
-| `mcp-radiology` | DICOM/DICOMweb | Orthanc (synthetic) → real PACS | Imaging studies, reports, DICOM viewer URLs. |
+| Service | Protocol | Backend | Reference |
+|---------|----------|---------|-----------|
+| `mcp-ehr` | FHIR R4 | HAPI FHIR (synthetic) → real EHR | Based on [wso2/fhir-mcp-server](https://github.com/wso2/fhir-mcp-server) |
+| `mcp-monitoring` | Custom | Synthetic → real vitals feeds | Custom — no upstream reference |
+| `mcp-radiology` | DICOM/DICOMweb | Orthanc (synthetic) → real PACS | Based on [ChristianHinge/dicom-mcp](https://github.com/ChristianHinge/dicom-mcp) |
 
-Each MCP server:
-- Has a health endpoint (`GET /health`).
-- Supports `degraded_mode`: returns cached/stale data with a staleness indicator when the backend is unreachable.
+**What each server does:**
+
+- **`mcp-ehr`** — Patient demographics, medications, allergies, labs, orders. Includes patient consent check. Wraps a FHIR R4 endpoint; the WSO2 FHIR MCP server provides a ready-made starting point.
+- **`mcp-monitoring`** — Real-time and historical vital signs (HR, BP, SpO2, temp). Custom service against synthetic vitals generator in Phase 1.
+- **`mcp-radiology`** — Imaging studies, reports, DICOM viewer URLs. Backed by Orthanc in Phase 1; the synthetic service models the [Orthanc REST API](https://orthanc.uclouvain.be/book/users/rest-cheatsheet.html). The `dicom-mcp` project provides the MCP-to-DICOM bridge.
+
+**Common traits** across all MCP servers:
+
+- Health endpoint (`GET /health`).
+- `degraded_mode`: returns cached/stale data with a staleness indicator when the backend is unreachable.
 - Tool result truncation: shows error if nanobot's 500-char limit is hit (increase limit in config).
 
 ### Human Escalation Tool
