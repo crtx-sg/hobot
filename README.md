@@ -24,18 +24,31 @@ No host Python install required — everything runs in containers.
 # 1. Clone and enter repo
 git clone <repo-url> && cd hobot
 
-# 2. Start Ollama and pull a model (first run only)
+# 2. (Optional) Set API keys for cloud providers
+export ANTHROPIC_API_KEY=sk-ant-...   # only if using Anthropic provider
+
+# 3. Start Ollama and pull a model (first run only)
 docker compose up ollama -d
 docker compose exec ollama ollama pull llama3.1:8b
 
-# 3. Start everything
+# 4. Build and start everything
 docker compose up -d --build
 
-# 4. Check gateway health (all backends should report "ok")
+# 5. Check gateway health (all backends should report "ok")
 curl http://localhost:3000/health
 
-# 5. Send a chat message
+# 6. Send a chat message
 curl -X POST http://localhost:3000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "message": "Show vitals for P001",
+    "user_id": "doc1",
+    "channel": "webchat",
+    "tenant_id": "T1"
+  }'
+
+# 7. Stream a chat (SSE)
+curl -N -X POST http://localhost:3000/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{
     "message": "Show vitals for P001",
@@ -52,22 +65,30 @@ First `docker compose up --build` takes a few minutes to build all 18 images. Su
 ## Architecture
 
 ```
-                        ┌─────────────┐
-                        │   Ollama    │
-                        │  (GPU/LLM)  │
-                        └──────▲──────┘
+                        ┌──────────────┐
+                        │ LLM Provider │
+                        │ (Ollama /    │
+                        │  OpenAI-compat)│
+                        └──────▲───────┘
                                │
 ┌──────────────────────────────┼──────────────────────────────────┐
 │  Nanobot Gateway (:3000)     │                                  │
 │  ┌────────────┐  ┌───────────┴──────┐  ┌────────────────────┐  │
 │  │ /chat      │→ │  Agent Loop      │→ │  Tool Dispatch     │──┼──→ Synthetic Backends
-│  │ /health    │  │  (Ollama + kw    │  │  (HTTP to backends)│  │
-│  │ /confirm   │  │   fallback)      │  └────────────────────┘  │
-│  └────────────┘  └──────────────────┘                           │
+│  │ /chat/stream│ │  (multi-provider │  │  (HTTP to backends)│  │
+│  │ /health    │  │   + kw fallback) │  │  (param validation)│  │
+│  │ /confirm   │  └──────────────────┘  └────────────────────┘  │
+│  └────────────┘                                                 │
 │  ┌────────────┐  ┌──────────────────┐  ┌────────────────────┐  │
-│  │ Audit Log  │  │ Clinical Memory  │  │ Response Formatter │  │
-│  │ (SQLite)   │  │ (fact extraction)│  │ (per-channel)      │  │
-│  └────────────┘  └──────────────────┘  └────────────────────┘  │
+│  │ Audit Log  │  │ Clinical Memory  │  │ PHI Redaction      │  │
+│  │ (SQLite)   │  │ (fact extraction │  │ (non-PHI-safe      │  │
+│  └────────────┘  │  + consolidation)│  │  providers)        │  │
+│                  └──────────────────┘  └────────────────────┘  │
+│  ┌────────────┐  ┌──────────────────┐                          │
+│  │ Sessions   │  │ Response         │                          │
+│  │ (JSONL     │  │ Formatter        │                          │
+│  │  on disk)  │  │ (per-channel)    │                          │
+│  └────────────┘  └──────────────────┘                          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -129,7 +150,28 @@ Send a message and get a response.
 }
 ```
 
-Pass `session_id` back on subsequent requests to maintain conversation context and clinical memory.
+Pass `session_id` back on subsequent requests to maintain conversation context and clinical memory. Sessions survive gateway restarts (persisted to JSONL on disk).
+
+### `POST /chat/stream`
+
+Streaming version of `/chat`. Same request body, returns Server-Sent Events (SSE).
+
+```bash
+curl -N -X POST http://localhost:3000/chat/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Show vitals for P001","user_id":"doc1","channel":"webchat","tenant_id":"T1"}'
+```
+
+**SSE event types:**
+
+| Event type | Fields | Description |
+|------------|--------|-------------|
+| `tool_call` | `tool`, `status` | Tool execution started |
+| `tool_result` | `tool`, `data` | Tool returned results |
+| `text` | `content` | Final synthesized response |
+| `done` | `session_id` | Stream complete |
+
+Each event is a `data:` line containing JSON. Full LLM response is buffered per iteration (no partial token streaming); SSE events are emitted between agent loop iterations.
 
 ### `POST /confirm/{confirmation_id}`
 
@@ -170,26 +212,80 @@ Returns per-backend health status.
 
 All config files live in `config/` and are mounted into the gateway at `/app/config`.
 
-### `config/tools.json` — Tool Criticality
+### `config/config.json` — Providers + Model Routing
 
-Controls which tools require human confirmation before execution.
+Defines LLM providers and which one to use by default.
 
 ```json
 {
-  "tools": {
-    "initiate_code_blue": { "critical": true },
-    "write_order": { "critical": true },
-    "order_blood_crossmatch": { "critical": true },
-    "dispense_medication": { "critical": true },
-    "request_ambulance": { "critical": true },
-    "order_lab": { "critical": true },
-    "get_vitals": { "critical": false },
-    "get_patient": { "critical": false }
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://ollama:11434",
+      "model": "llama3.1:8b",
+      "phi_safe": true
+    },
+    "anthropic": {
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "model": "claude-sonnet-4-20250514",
+      "phi_safe": false
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "llama3.1:8b",
+      "provider": "ollama"
+    }
   }
 }
 ```
 
-Critical tools return a `confirmation_id` on first call. The clinician must POST `/confirm/{id}` to execute.
+| Provider field | Description |
+|----------------|-------------|
+| `baseUrl` | API base URL. Ollama uses `/api/chat`, others use `/v1/chat/completions` |
+| `apiKey` | API key. Supports `${ENV_VAR}` expansion |
+| `model` | Model name/ID sent to the provider |
+| `phi_safe` | If `false`, PHI is redacted before sending messages to this provider |
+| `timeout` | Request timeout in seconds (default: 60) |
+
+The `agents.defaults.provider` selects the global default. If the default provider is unavailable at runtime, the agent falls back to keyword-based intent detection.
+
+### `config/tools.json` — Tool Criticality + Parameter Schemas
+
+Controls which tools require human confirmation and validates tool parameters.
+
+```json
+{
+  "tools": {
+    "order_lab": {
+      "critical": true,
+      "params": {
+        "patient_id": {"type": "string", "required": true},
+        "test_code": {"type": "string", "required": true},
+        "priority": {"type": "string", "enum": ["routine", "stat", "urgent"]}
+      }
+    },
+    "get_vitals": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "list_wards": { "critical": false }
+  }
+}
+```
+
+Parameter validation rules:
+
+| Rule | Description |
+|------|-------------|
+| `type` | `"string"` or `"number"` — type check |
+| `required` | If `true`, param must be present |
+| `enum` | Allowed values list |
+| `pattern` | Regex pattern (matched with `re.match`) |
+
+Tools without a `params` key skip validation. Validation runs before criticality checks and tool dispatch.
 
 ### `config/channels.json` — Channel Capabilities
 
@@ -211,38 +307,12 @@ Controls how responses are formatted per output channel.
       "tables": true,
       "images": true,
       "max_msg_length": null
-    },
-    "slack": {
-      "rich_text": true,
-      "buttons": true,
-      "tables": true,
-      "images": true,
-      "max_msg_length": 40000
     }
   }
 }
 ```
 
 When `tables: false`, markdown tables are converted to plain text. When `max_msg_length` is set, responses are truncated.
-
-### `config/config.json` — Provider Config
-
-```json
-{
-  "providers": {
-    "ollama": {
-      "baseUrl": "http://ollama:11434",
-      "phi_safe": true
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": "llama3.1:8b",
-      "provider": "ollama"
-    }
-  }
-}
-```
 
 ---
 
@@ -252,12 +322,14 @@ The gateway reads these from docker-compose (all have defaults):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_HOST` | `http://ollama:11434` | Ollama API endpoint |
-| `OLLAMA_MODEL` | `llama3.1:8b` | Model for agent reasoning |
+| `CONFIG_PATH` | `/app/config/config.json` | Provider + model config |
+| `TOOLS_CONFIG` | `/app/config/tools.json` | Tool criticality + param schemas |
+| `CHANNELS_CONFIG` | `/app/config/channels.json` | Channel formatting config |
 | `AUDIT_DB` | `/data/audit/clinic.db` | SQLite audit database path |
 | `SCHEMA_PATH` | `/app/schema/init.sql` | SQL schema for DB init |
-| `TOOLS_CONFIG` | `/app/config/tools.json` | Tool criticality config |
-| `CHANNELS_CONFIG` | `/app/config/channels.json` | Channel formatting config |
+| `SESSIONS_DIR` | `/data/sessions` | JSONL session persistence directory |
+| `CONSOLIDATION_THRESHOLD` | `30` | Messages before memory consolidation triggers |
+| `OLLAMA_HOST` | `http://ollama:11434` | Ollama API endpoint (legacy, used by keyword fallback) |
 | `MONITORING_BASE` | `http://synthetic-monitoring:8000` | Vitals backend |
 | `EHR_BASE` | `http://synthetic-ehr:8080` | EHR/FHIR backend |
 | `LIS_BASE` | `http://synthetic-lis:8000` | Lab backend |
@@ -266,6 +338,7 @@ The gateway reads these from docker-compose (all have defaults):
 | `BLOODBANK_BASE` | `http://synthetic-bloodbank:8000` | Blood bank backend |
 | `ERP_BASE` | `http://synthetic-erp:8000` | ERP/inventory backend |
 | `PATIENT_SERVICES_BASE` | `http://synthetic-patient-services:8000` | Patient services backend |
+| `ANTHROPIC_API_KEY` | (none) | Required if using Anthropic provider |
 
 To point at real hospital systems, change the `*_BASE` variables to their production URLs.
 
@@ -289,19 +362,58 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 
 ---
 
-## Agent Modes
+## Key Features
 
-The gateway agent operates in two modes:
+### Multi-Provider LLM Routing
 
-**Ollama mode (primary):** When Ollama is reachable, the agent sends conversation context + tool definitions to the LLM. The LLM selects tools and synthesizes natural language responses from results. Supports multi-step reasoning (up to 10 iterations per request).
+The gateway supports multiple LLM backends through a provider abstraction layer (`providers.py`). Two provider types are built in:
 
-**Keyword fallback:** When Ollama is unavailable, the agent uses regex-based intent detection to map messages to tools. Tool results are returned as formatted JSON. Examples:
+- **OllamaProvider** — local GPU inference via Ollama `/api/chat`
+- **OpenAICompatibleProvider** — any `/v1/chat/completions` API (OpenAI, Anthropic-compatible, vLLM, etc.)
+
+Provider selection is global (configured in `config.json`). At runtime, the gateway checks provider health; if the default provider is down, the agent falls back to keyword-based intent detection.
+
+### Session Persistence
+
+Sessions are persisted as JSONL files at `{SESSIONS_DIR}/{tenant_id}/{session_id}.jsonl`. Each file contains:
+- Line 0: session metadata (user, tenant, consolidation state, active patients)
+- Lines 1+: message records and consolidation events
+
+Sessions survive gateway restarts. On startup, sessions are loaded from disk on first access. The in-memory cache avoids repeated disk reads during a conversation.
+
+### Memory Consolidation
+
+When a session accumulates more than `CONSOLIDATION_THRESHOLD` messages (default: 30), the agent summarizes older messages into a clinical summary using the LLM. The summary is prepended to the context window as a system message. The 10 most recent messages are always kept verbatim.
+
+Consolidation preserves: patient IDs, diagnoses, key vitals, medications, pending actions, and clinical decisions. If the LLM provider is unavailable, the existing summary is kept and the pointer advances.
+
+### Streaming (SSE)
+
+The `/chat/stream` endpoint emits Server-Sent Events between agent loop iterations. Each iteration buffers the full LLM response (no partial token streaming). Events let clients show real-time progress:
+1. Tool call started → tool result returned → next iteration
+2. Final text response → done
+
+### Tool Parameter Validation
+
+Tool parameters are validated against schemas defined in `config/tools.json` before dispatch. Validation checks `required`, `type`, `enum`, and `pattern` constraints. Invalid parameters return an error immediately without hitting the backend.
+
+### PHI Redaction
+
+When routing to a non-PHI-safe provider (e.g. cloud APIs), the gateway redacts PHI from all messages before sending to the LLM:
+- Patient IDs (`P001`, `UHID12345`)
+- MRN identifiers (`MRN00123`)
+- Dates of birth
+- Phone numbers
+
+Tokens are restored in the LLM response. Ollama (local) is marked `phi_safe: true` and skips redaction. Audit log summaries are also redacted before storage.
+
+### Keyword Fallback
+
+When no LLM provider is available, the agent uses regex-based intent detection to map messages to tools directly. Examples:
 - "vitals for P001" → `get_vitals(patient_id="P001")`
 - "list wards" → `list_wards()`
 - "lab results P001" → `get_lab_results(patient_id="P001")`
 - "blood availability" → `get_blood_availability()`
-
-Ollama health is checked at startup and re-checked on failure.
 
 ---
 
@@ -327,34 +439,24 @@ Browse the audit database at `http://localhost:8081` (sqlite-web UI).
 
 ---
 
-## PHI Protection
-
-When routing to a non-PHI-safe provider, the gateway activates regex-based PHI redaction:
-- Patient IDs (P001, UHID12345)
-- Dates of birth
-- Phone numbers
-
-are replaced with tokens before sending to the LLM, then restored in the response. Ollama (local) is marked `phi_safe: true` and skips redaction.
-
----
-
 ## Project Structure
 
 ```
 hobot/
 ├── config/
-│   ├── config.json          # Provider + model config
-│   ├── tools.json           # Tool criticality flags
+│   ├── config.json          # Provider + model routing config
+│   ├── tools.json           # Tool criticality + parameter schemas
 │   └── channels.json        # Channel formatting capabilities
 ├── schema/
 │   └── init.sql             # Audit DB schema (SQLite)
 ├── nanobot/                  # Gateway (FastAPI, port 3000)
-│   ├── main.py              # App + endpoints (/chat, /health, /confirm)
-│   ├── agent.py             # Agent loop (Ollama + keyword fallback)
-│   ├── tools.py             # Tool registry + HTTP dispatch + critical gate
+│   ├── main.py              # App + endpoints (/chat, /chat/stream, /health, /confirm)
+│   ├── agent.py             # Agent loop (multi-provider + consolidation + streaming)
+│   ├── providers.py         # LLM provider abstraction (Ollama, OpenAI-compatible)
+│   ├── tools.py             # Tool registry + param validation + HTTP dispatch + critical gate
 │   ├── audit.py             # SQLite audit logging
 │   ├── clinical_memory.py   # Fact extraction + storage
-│   ├── session.py           # In-memory session manager
+│   ├── session.py           # JSONL-backed session persistence
 │   ├── formatter.py         # Channel-aware response formatting
 │   ├── phi.py               # PHI redaction/restoration
 │   ├── Dockerfile
@@ -372,25 +474,74 @@ hobot/
 
 ---
 
-## Operations
+## Setup & Operations
 
-### Start / Stop
+### First-Time Setup
 
 ```bash
-# Start everything
-docker compose up -d --build
+# 1. Clone
+git clone <repo-url> && cd hobot
 
-# Stop everything (data persisted in volumes)
+# 2. (Optional) Configure cloud provider keys
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# 3. Start Ollama and pull the model
+docker compose up ollama -d
+docker compose exec ollama ollama pull llama3.1:8b
+
+# 4. Build and start the full stack
+docker compose up -d --build
+# First build takes a few minutes (18 images). Subsequent starts are fast.
+
+# 5. Verify
+curl http://localhost:3000/health
+```
+
+### Start
+
+```bash
+# Start all services (detached)
+docker compose up -d
+
+# Start just the gateway (if backends already running)
+docker compose up -d nanobot-gateway
+```
+
+### Stop
+
+```bash
+# Stop all services (volumes preserved — sessions, audit, models retained)
 docker compose down
 
-# Stop and delete all data
+# Stop and delete ALL data (sessions, audit DB, Ollama models)
 docker compose down -v
+```
+
+### Restart Gateway Only
+
+```bash
+docker compose restart nanobot-gateway
+```
+
+Sessions persist across restarts (JSONL on disk). Reuse the same `session_id` to continue a conversation.
+
+### Rebuild After Code Changes
+
+```bash
+# Rebuild + restart gateway only
+docker compose build nanobot-gateway && docker compose up -d nanobot-gateway
+
+# Rebuild a specific service
+docker compose build mcp-bloodbank && docker compose up -d mcp-bloodbank
+
+# Rebuild everything
+docker compose up -d --build
 ```
 
 ### Logs
 
 ```bash
-# Gateway logs
+# Gateway logs (follow)
 docker compose logs -f nanobot-gateway
 
 # All logs
@@ -400,22 +551,77 @@ docker compose logs -f
 docker compose logs -f synthetic-monitoring
 ```
 
-### Rebuild a single service
+### Change the Default LLM Model
 
-```bash
-docker compose build mcp-bloodbank
-docker compose up -d mcp-bloodbank
+Edit `config/config.json`:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://ollama:11434",
+      "model": "llama3.2-vision",
+      "phi_safe": true
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "ollama"
+    }
+  }
+}
 ```
 
-### Change the Ollama model
+Then pull the model and restart:
 
 ```bash
 docker compose exec ollama ollama pull llama3.2-vision
-# Then set OLLAMA_MODEL=llama3.2-vision in docker-compose.yml and restart:
+docker compose restart nanobot-gateway
+```
+
+### Switch to a Cloud Provider
+
+Set the API key and change the default provider in `config/config.json`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "provider": "anthropic"
+    }
+  }
+}
+```
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
 docker compose up -d nanobot-gateway
 ```
 
-### Inspect audit database
+PHI redaction activates automatically for providers with `"phi_safe": false`.
+
+### Verify Session Persistence
+
+```bash
+# Send a message, note the session_id
+curl -s -X POST http://localhost:3000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Show vitals for P001","user_id":"doc1","channel":"webchat","tenant_id":"T1"}' \
+  | jq .session_id
+
+# Restart the gateway
+docker compose restart nanobot-gateway
+
+# Continue the same session
+curl -X POST http://localhost:3000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"What did I ask?","user_id":"doc1","channel":"webchat","tenant_id":"T1","session_id":"<id>"}'
+
+# Inspect session files on disk
+docker compose exec nanobot-gateway ls /data/sessions/T1/
+```
+
+### Inspect Audit Database
 
 Open `http://localhost:8081` in a browser, or query directly:
 
@@ -446,6 +652,7 @@ Remove the corresponding `synthetic-*` service and its `mcp-*` dependency. The g
 |--------|-----------|---------|
 | `ollama-models` | ollama `/root/.ollama` | Persists downloaded LLM models |
 | `audit-data` | nanobot-gateway `/data/audit`, audit-db `/data` | SQLite audit + clinical facts DB |
+| `sessions-data` | nanobot-gateway `/data/sessions` | JSONL session files (per-tenant) |
 | `hdf5-data` | synthetic-monitoring `/data/hdf5` | Persists HDF5 vitals data across restarts |
 
 ---
