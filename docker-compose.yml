@@ -1,0 +1,153 @@
+services:
+  # --- Core ---
+  nanobot-gateway:
+    build: ./nanobot
+    depends_on:
+      - ollama
+      - mcp-ehr
+      - mcp-monitoring
+      - mcp-radiology
+      - mcp-lis
+      - mcp-pharmacy
+      - mcp-bloodbank
+      - mcp-erp
+      - mcp-patient-services
+      - audit-db
+    volumes:
+      - ./config:/app/config
+      - ./schema:/app/schema
+      - audit-data:/data/audit
+      - sessions-data:/data/sessions
+    ports:
+      - "3000:3000"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - AUDIT_DB=/data/audit/clinic.db
+      - SCHEMA_PATH=/app/schema/init.sql
+      - TOOLS_CONFIG=/app/config/tools.json
+      - CHANNELS_CONFIG=/app/config/channels.json
+      - MONITORING_BASE=http://synthetic-monitoring:8000
+      - EHR_BASE=http://synthetic-ehr:8080
+      - LIS_BASE=http://synthetic-lis:8000
+      - PHARMACY_BASE=http://synthetic-pharmacy:8000
+      - RADIOLOGY_BASE=http://synthetic-radiology:8042
+      - BLOODBANK_BASE=http://synthetic-bloodbank:8000
+      - ERP_BASE=http://synthetic-erp:8000
+      - PATIENT_SERVICES_BASE=http://synthetic-patient-services:8000
+      - SESSIONS_DIR=/data/sessions
+      - CONFIG_PATH=/app/config/config.json
+
+  # --- Telegram Bot ---
+  telegram-bot:
+    build: ./telegram-bot
+    depends_on: [nanobot-gateway]
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GATEWAY_URL=http://nanobot-gateway:3000
+      - TENANT_ID=default
+    restart: unless-stopped
+
+  # --- Model ---
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --- MCP Tool Servers ---
+  mcp-ehr:
+    build: ./mcp-ehr
+    depends_on: [synthetic-ehr]
+    environment:
+      - FHIR_BASE=http://synthetic-ehr:8080/fhir
+
+  mcp-monitoring:
+    build: ./mcp-monitoring
+    depends_on: [synthetic-monitoring]
+    environment:
+      - MONITORING_BASE=http://synthetic-monitoring:8000
+
+  mcp-radiology:
+    build: ./mcp-radiology
+    depends_on: [synthetic-radiology]
+    environment:
+      - ORTHANC_BASE=http://synthetic-radiology:8042
+
+  mcp-lis:
+    build: ./mcp-lis
+    depends_on: [synthetic-lis]
+    environment:
+      - LIS_BASE=http://synthetic-lis:8000
+
+  mcp-pharmacy:
+    build: ./mcp-pharmacy
+    depends_on: [synthetic-pharmacy]
+    environment:
+      - PHARMACY_BASE=http://synthetic-pharmacy:8000
+
+  mcp-bloodbank:
+    build: ./mcp-bloodbank
+    depends_on: [synthetic-bloodbank]
+    environment:
+      - BLOODBANK_BASE=http://synthetic-bloodbank:8000
+
+  mcp-erp:
+    build: ./mcp-erp
+    depends_on: [synthetic-erp]
+    environment:
+      - ERP_BASE=http://synthetic-erp:8000
+
+  mcp-patient-services:
+    build: ./mcp-patient-services
+    depends_on: [synthetic-patient-services]
+    environment:
+      - PATIENT_SERVICES_BASE=http://synthetic-patient-services:8000
+
+  # --- Synthetic Backends ---
+  synthetic-ehr:
+    image: hapiproject/hapi:latest
+    ports: ["8080:8080"]
+
+  synthetic-monitoring:
+    build: ./synthetic-monitoring
+    volumes:
+      - hdf5-data:/data/hdf5
+
+  synthetic-radiology:
+    image: orthancteam/orthanc
+    ports: ["8042:8042"]
+
+  synthetic-lis:
+    build: ./synthetic-lis
+
+  synthetic-pharmacy:
+    build: ./synthetic-pharmacy
+
+  synthetic-bloodbank:
+    build: ./synthetic-bloodbank
+
+  synthetic-erp:
+    build: ./synthetic-erp
+
+  synthetic-patient-services:
+    build: ./synthetic-patient-services
+
+  # --- Audit DB Web UI ---
+  audit-db:
+    image: coleifer/sqlite-web
+    volumes:
+      - audit-data:/data
+    ports: ["8081:8080"]
+    command: sqlite_web -H 0.0.0.0 /data/clinic.db
+
+volumes:
+  ollama-models:
+  audit-data:
+  sessions-data:
+  hdf5-data:

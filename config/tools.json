@@ -1,0 +1,172 @@
+{
+  "tools": {
+    "initiate_code_blue": {
+      "critical": true,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "write_order": {
+      "critical": true,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "order_blood_crossmatch": {
+      "critical": true,
+      "params": {
+        "patient_id": {"type": "string", "required": true},
+        "blood_type": {"type": "string", "required": true, "enum": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]}
+      }
+    },
+    "dispense_medication": {
+      "critical": true,
+      "params": {
+        "patient_id": {"type": "string", "required": true},
+        "medication_id": {"type": "string", "required": true}
+      }
+    },
+    "request_ambulance": {
+      "critical": true,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_vitals": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_vitals_history": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "list_wards": { "critical": false },
+    "list_doctors": { "critical": false },
+    "get_ward_patients": {
+      "critical": false,
+      "params": {
+        "ward_id": {"type": "string", "required": true}
+      }
+    },
+    "get_doctor_patients": {
+      "critical": false,
+      "params": {
+        "doctor_id": {"type": "string", "required": true}
+      }
+    },
+    "get_patient_events": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_event_vitals": {
+      "critical": false,
+      "params": {
+        "event_id": {"type": "string", "required": true}
+      }
+    },
+    "get_event_ecg": {
+      "critical": false,
+      "params": {
+        "event_id": {"type": "string", "required": true}
+      }
+    },
+    "get_patient": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_medications": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_allergies": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_orders": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_studies": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_report": {
+      "critical": false,
+      "params": {
+        "study_id": {"type": "string", "required": true}
+      }
+    },
+    "get_latest_study": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_lab_results": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
+    "get_lab_order": {
+      "critical": false,
+      "params": {
+        "order_id": {"type": "string", "required": true}
+      }
+    },
+    "order_lab": {
+      "critical": true,
+      "params": {
+        "patient_id": {"type": "string", "required": true},
+        "test_code": {"type": "string", "required": true},
+        "priority": {"type": "string", "enum": ["routine", "stat", "urgent"]}
+      }
+    },
+    "get_order_status": {
+      "critical": false,
+      "params": {
+        "order_id": {"type": "string", "required": true}
+      }
+    },
+    "check_drug_interactions": { "critical": false },
+    "get_blood_availability": { "critical": false },
+    "get_crossmatch_status": {
+      "critical": false,
+      "params": {
+        "request_id": {"type": "string", "required": true}
+      }
+    },
+    "get_inventory": { "critical": false },
+    "get_equipment_status": {
+      "critical": false,
+      "params": {
+        "equipment_id": {"type": "string", "required": true}
+      }
+    },
+    "place_supply_order": { "critical": false },
+    "request_housekeeping": { "critical": false },
+    "order_diet": { "critical": false },
+    "get_request_status": {
+      "critical": false,
+      "params": {
+        "request_id": {"type": "string", "required": true}
+      }
+    }
+  }
+}

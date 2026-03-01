@@ -58,7 +58,7 @@ curl -N -X POST http://localhost:3000/chat/stream \
   }'
 ```
 
-First `docker compose up --build` takes a few minutes to build all 18 images. Subsequent starts are fast.
+First `docker compose up --build` takes a few minutes to build all images. Subsequent starts are fast.
 
 ---
 
@@ -92,7 +92,7 @@ First `docker compose up --build` takes a few minutes to build all 18 images. Su
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**18 containers total:**
+**20 containers total:**
 
 | Layer | Containers |
 |-------|-----------|
@@ -100,6 +100,7 @@ First `docker compose up --build` takes a few minutes to build all 18 images. Su
 | Model | `ollama` |
 | MCP tool servers (8) | `mcp-ehr`, `mcp-monitoring`, `mcp-radiology`, `mcp-lis`, `mcp-pharmacy`, `mcp-bloodbank`, `mcp-erp`, `mcp-patient-services` |
 | Synthetic backends (8) | `synthetic-ehr` (HAPI FHIR), `synthetic-monitoring`, `synthetic-radiology` (Orthanc), `synthetic-lis`, `synthetic-pharmacy`, `synthetic-bloodbank`, `synthetic-erp`, `synthetic-patient-services` |
+| Channels | `telegram-bot` |
 | Utilities | `audit-db` (SQLite Web UI) |
 
 ---
@@ -461,12 +462,16 @@ hobot/
 │   ├── phi.py               # PHI redaction/restoration
 │   ├── Dockerfile
 │   └── requirements.txt
+├── telegram-bot/              # Telegram bot bridge (polling)
+│   ├── bot.py               # Forwards messages to gateway /chat
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── mcp-*/                    # MCP tool servers (8 services)
 │   ├── server.py            # FastMCP stdio server + health endpoint
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── synthetic-*/              # Synthetic backends (8 services)
-│   ├── main.py              # FastAPI REST API with in-memory data
+│   ├── app.py               # FastAPI REST API with in-memory data
 │   ├── Dockerfile
 │   └── requirements.txt
 └── docker-compose.yml        # Full stack orchestration
@@ -491,7 +496,7 @@ docker compose exec ollama ollama pull llama3.1:8b
 
 # 4. Build and start the full stack
 docker compose up -d --build
-# First build takes a few minutes (18 images). Subsequent starts are fast.
+# First build takes a few minutes (20 images). Subsequent starts are fast.
 
 # 5. Verify
 curl http://localhost:3000/health
@@ -536,19 +541,6 @@ docker compose build mcp-bloodbank && docker compose up -d mcp-bloodbank
 
 # Rebuild everything
 docker compose up -d --build
-```
-
-### Logs
-
-```bash
-# Gateway logs (follow)
-docker compose logs -f nanobot-gateway
-
-# All logs
-docker compose logs -f
-
-# Specific service
-docker compose logs -f synthetic-monitoring
 ```
 
 ### Change the Default LLM Model
@@ -621,13 +613,178 @@ curl -X POST http://localhost:3000/chat \
 docker compose exec nanobot-gateway ls /data/sessions/T1/
 ```
 
-### Inspect Audit Database
+---
 
-Open `http://localhost:8081` in a browser, or query directly:
+## Debugging & Log Analysis
+
+### Viewing Logs
 
 ```bash
-docker compose exec audit-db sqlite3 /data/clinic.db "SELECT * FROM audit_log ORDER BY id DESC LIMIT 10;"
+# Gateway logs (follow)
+docker compose logs -f nanobot-gateway
+
+# Gateway + all backends (trace requests end-to-end)
+docker compose logs -f nanobot-gateway synthetic-monitoring synthetic-ehr \
+  synthetic-lis synthetic-pharmacy synthetic-radiology synthetic-bloodbank \
+  synthetic-erp synthetic-patient-services
+
+# All services
+docker compose logs -f
+
+# Specific backend
+docker compose logs -f synthetic-monitoring
+
+# Last 50 lines (no follow)
+docker compose logs --tail 50 nanobot-gateway
 ```
+
+### Tracing a Request
+
+To follow a single query through the system, tail the logs in one terminal and fire a request in another.
+
+**Terminal 1:**
+
+```bash
+docker compose logs -f nanobot-gateway
+```
+
+**Terminal 2:**
+
+```bash
+curl -s -X POST http://localhost:3000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Show vitals for P001","user_id":"doc1","channel":"webchat","tenant_id":"T1"}' | python3 -m json.tool
+```
+
+**What appears in order:**
+
+| Step | Logger | What you see |
+|------|--------|--------------|
+| 1. Request received | `nanobot` | FastAPI access log: `POST /chat` |
+| 2. Provider health check | `nanobot.providers` | `HTTP Request: GET http://ollama:11434/api/tags` (skipped if cached) |
+| 3. LLM inference | `httpx` | `HTTP Request: POST http://ollama:11434/api/chat "HTTP/1.1 200 OK"` |
+| 4. Tool dispatch | `httpx` | `HTTP Request: GET http://synthetic-monitoring:8000/vitals/P001` |
+| 5. LLM synthesis | `httpx` | Second `POST .../api/chat` (LLM summarizes tool result) |
+| 6. Response returned | `nanobot` | FastAPI response log |
+
+If Ollama is down, steps 2-5 are replaced by keyword fallback (no `httpx` LLM calls, just the backend tool call).
+
+### Using the Streaming Endpoint for Tracing
+
+The SSE endpoint shows you each agent loop iteration in real time — useful for understanding multi-step tool chains:
+
+```bash
+curl -N -X POST http://localhost:3000/chat/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Show vitals for P001","user_id":"doc1","channel":"webchat","tenant_id":"T1"}'
+```
+
+Each `data:` line maps to an agent step:
+
+```
+data: {"type":"tool_call","tool":"get_vitals","status":"started"}    ← tool selected
+data: {"type":"tool_result","tool":"get_vitals","data":{...}}        ← backend responded
+data: {"type":"text","content":"Patient P001 vitals are..."}         ← LLM synthesis
+data: {"type":"done","session_id":"abc-123"}                         ← complete
+```
+
+### Audit Database Queries
+
+Browse the audit UI at `http://localhost:8081`, or query from the command line.
+
+**`audit_log` table columns:** `id`, `tenant_id`, `timestamp`, `session_id`, `user_id`, `channel`, `action`, `tool_name`, `params_hash`, `result_summary`, `confirmation_id`, `provider`, `model`, `latency_ms`
+
+```bash
+# Recent actions with timing
+docker compose exec audit-db sqlite3 /data/clinic.db \
+  "SELECT id, datetime(timestamp), action, tool_name, provider, latency_ms
+   FROM audit_log ORDER BY id DESC LIMIT 10;"
+
+# All tool calls for a specific session
+docker compose exec audit-db sqlite3 /data/clinic.db \
+  "SELECT datetime(timestamp), action, tool_name, result_summary
+   FROM audit_log WHERE session_id='<SESSION_ID>' ORDER BY id;"
+
+# Slowest requests (latency > 5s)
+docker compose exec audit-db sqlite3 /data/clinic.db \
+  "SELECT id, datetime(timestamp), action, tool_name, provider, latency_ms
+   FROM audit_log WHERE latency_ms > 5000 ORDER BY latency_ms DESC LIMIT 20;"
+
+# Critical tool confirmations
+docker compose exec audit-db sqlite3 /data/clinic.db \
+  "SELECT id, datetime(timestamp), tool_name, confirmation_id
+   FROM audit_log WHERE action IN ('critical_tool_gated','critical_tool_confirmed')
+   ORDER BY id DESC LIMIT 10;"
+
+# Escalation history
+docker compose exec audit-db sqlite3 /data/clinic.db \
+  "SELECT e.id, a.timestamp, e.escalated_to, e.reason, e.resolved_at
+   FROM escalations e JOIN audit_log a ON e.audit_log_id = a.id
+   ORDER BY e.id DESC LIMIT 10;"
+
+# Clinical facts for a patient
+docker compose exec audit-db sqlite3 /data/clinic.db \
+  "SELECT fact_type, fact_data, source_tool, recorded_at
+   FROM clinical_facts WHERE patient_id='P001' ORDER BY id DESC LIMIT 10;"
+
+# Provider usage breakdown
+docker compose exec audit-db sqlite3 /data/clinic.db \
+  "SELECT provider, COUNT(*) as calls, AVG(latency_ms) as avg_ms
+   FROM audit_log WHERE action='chat_response' GROUP BY provider;"
+```
+
+### Inspecting Sessions on Disk
+
+```bash
+# List sessions for a tenant
+docker compose exec nanobot-gateway ls /data/sessions/T1/
+
+# Read a session JSONL (line 0 = metadata, lines 1+ = messages)
+docker compose exec nanobot-gateway cat /data/sessions/T1/<session_id>.jsonl
+
+# Count messages in a session
+docker compose exec nanobot-gateway wc -l /data/sessions/T1/<session_id>.jsonl
+
+# Check consolidation state (summary field in metadata line)
+docker compose exec nanobot-gateway head -1 /data/sessions/T1/<session_id>.jsonl | python3 -m json.tool
+```
+
+### Common Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `"status":"degraded"` in `/health` | One or more backends down | Check `docker compose ps`, restart failed service |
+| All responses are keyword-formatted JSON | LLM provider unreachable | Check `docker compose logs ollama`, verify model is pulled |
+| `Ollama chat failed` in logs | Model not loaded or OOM | `docker compose exec ollama ollama list`, check GPU memory |
+| `Invalid parameters:` error returned | Tool params failed validation | Check params against schema in `config/tools.json` |
+| Session not found after restart | Wrong `tenant_id` on follow-up request | `tenant_id` is part of the session path; must match |
+| 10s+ response times | Normal LLM inference for local models | Use a smaller model (`qwen2.5:7b`) or cloud provider |
+| Provider health check every request | Health cache expired (30s TTL) | Normal; first request after 30s incurs one `/api/tags` call |
+
+---
+
+## Telegram Bot Setup
+
+Connect Hobot to Telegram so clinicians can chat from their phone.
+
+1. Message [@BotFather](https://t.me/BotFather) on Telegram → `/newbot` → copy the token
+2. Set the token:
+   ```bash
+   export TELEGRAM_BOT_TOKEN=<your-token>
+   ```
+3. Start the bot:
+   ```bash
+   docker compose up -d --build telegram-bot
+   ```
+4. Open Telegram, find your bot, and send a message (e.g. "Show vitals for P001")
+
+The bot uses long-polling (no public URL or webhook required). Sessions are keyed by Telegram chat ID (`tg-<chat_id>`), so each chat maintains its own conversation history.
+
+| Variable | Required | Default |
+|----------|----------|---------|
+| `TELEGRAM_BOT_TOKEN` | yes | — |
+| `GATEWAY_URL` | no | `http://nanobot-gateway:3000` |
+| `TENANT_ID` | no | `default` |
 
 ---
 

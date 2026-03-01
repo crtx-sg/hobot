@@ -1,0 +1,25 @@
+{
+  "channels": {
+    "telegram": {
+      "rich_text": true,
+      "buttons": false,
+      "tables": false,
+      "images": true,
+      "max_msg_length": 4096
+    },
+    "webchat": {
+      "rich_text": true,
+      "buttons": true,
+      "tables": true,
+      "images": true,
+      "max_msg_length": null
+    },
+    "slack": {
+      "rich_text": true,
+      "buttons": true,
+      "tables": true,
+      "images": true,
+      "max_msg_length": 40000
+    }
+  }
+}

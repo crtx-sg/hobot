@@ -1,0 +1,21 @@
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://ollama:11434",
+      "model": "qwen2.5:7b",
+      "phi_safe": true
+    },
+    "anthropic": {
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "model": "claude-sonnet-4-20250514",
+      "phi_safe": false
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "qwen2.5:7b",
+      "provider": "ollama"
+    }
+  }
+}
