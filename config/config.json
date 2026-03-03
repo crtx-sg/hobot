@@ -1,5 +1,12 @@
 {
   "providers": {
+    "gemini": {
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "apiKey": "${GEMINI_API_KEY}",
+      "model": "gemini-2.0-flash",
+      "phi_safe": false,
+      "timeout": 30.0
+    },
     "ollama": {
       "baseUrl": "http://ollama:11434",
       "model": "qwen2.5:7b",
@@ -14,8 +21,8 @@
   },
   "agents": {
     "defaults": {
-      "model": "qwen2.5:7b",
-      "provider": "ollama"
+      "model": "gemini-2.0-flash",
+      "provider": "gemini"
     }
   }
 }

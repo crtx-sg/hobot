@@ -24,20 +24,16 @@ No host Python install required — everything runs in containers.
 # 1. Clone and enter repo
 git clone <repo-url> && cd hobot
 
-# 2. (Optional) Set API keys for cloud providers
-export ANTHROPIC_API_KEY=sk-ant-...   # only if using Anthropic provider
+# 2. Set Gemini API key (default provider)
+export GEMINI_API_KEY=your-gemini-api-key
 
-# 3. Start Ollama and pull a model (first run only)
-docker compose up ollama -d
-docker compose exec ollama ollama pull llama3.1:8b
-
-# 4. Build and start everything
+# 3. Build and start everything
 docker compose up -d --build
 
-# 5. Check gateway health (all backends should report "ok")
+# 4. Check gateway health (all backends should report "ok")
 curl http://localhost:3000/health
 
-# 6. Send a chat message
+# 5. Send a chat message
 curl -X POST http://localhost:3000/chat \
   -H 'Content-Type: application/json' \
   -d '{
@@ -47,7 +43,7 @@ curl -X POST http://localhost:3000/chat \
     "tenant_id": "T1"
   }'
 
-# 7. Stream a chat (SSE)
+# 6. Stream a chat (SSE)
 curl -N -X POST http://localhost:3000/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{
@@ -67,8 +63,8 @@ First `docker compose up --build` takes a few minutes to build all images. Subse
 ```
                         ┌──────────────┐
                         │ LLM Provider │
-                        │ (Ollama /    │
-                        │  OpenAI-compat)│
+                        │ (Gemini /    │
+                        │ Ollama / Any)│
                         └──────▲───────┘
                                │
 ┌──────────────────────────────┼──────────────────────────────────┐
@@ -138,7 +134,7 @@ Send a message and get a response.
 |-------|------|----------|-------------|
 | `message` | string | yes | Natural language query |
 | `user_id` | string | yes | Clinician identifier |
-| `channel` | string | no | `webchat` (default), `telegram`, `slack` |
+| `channel` | string | no | `webchat` (default), `telegram`, `slack`, `whatsapp` |
 | `tenant_id` | string | no | Tenant for multi-hospital. Default: `default` |
 | `session_id` | string | no | Omit to start new session; pass to continue |
 
@@ -146,10 +142,22 @@ Send a message and get a response.
 
 ```json
 {
-  "response": "**get_vitals** result:\n```json\n{...}\n```",
-  "session_id": "a1b2c3d4-..."
+  "response": "Patient P001 vitals: HR 82 bpm, BP 120/80...",
+  "session_id": "a1b2c3d4-...",
+  "blocks": [
+    {"type": "data_table", "title": "Vitals — P001", "tool": "get_vitals",
+     "columns": ["Metric","Value","Unit"], "rows": [["HR","82","bpm"], ...]},
+    {"type": "alert", "severity": "warning", "text": "Heart Rate abnormal: 94"},
+    {"type": "actions", "buttons": [{"label":"View History","action":"get_vitals_history","params":{"patient_id":"P001"}}]}
+  ]
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `response` | string | Always present. Plain text response (backward-compatible). |
+| `session_id` | string | Session identifier for conversation continuity. |
+| `blocks` | list or null | Structured UI blocks for rich rendering. `null` when no tool calls were made. Old clients ignore this field and use `response`. |
 
 Pass `session_id` back on subsequent requests to maintain conversation context and clinical memory. Sessions survive gateway restarts (persisted to JSONL on disk).
 
@@ -215,14 +223,21 @@ All config files live in `config/` and are mounted into the gateway at `/app/con
 
 ### `config/config.json` — Providers + Model Routing
 
-Defines LLM providers and which one to use by default.
+Defines LLM providers and which one to use by default. The current default is **Google Gemini** (`gemini-2.0-flash`).
 
 ```json
 {
   "providers": {
+    "gemini": {
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "apiKey": "${GEMINI_API_KEY}",
+      "model": "gemini-2.0-flash",
+      "phi_safe": false,
+      "timeout": 30.0
+    },
     "ollama": {
       "baseUrl": "http://ollama:11434",
-      "model": "llama3.1:8b",
+      "model": "qwen2.5:7b",
       "phi_safe": true
     },
     "anthropic": {
@@ -234,16 +249,24 @@ Defines LLM providers and which one to use by default.
   },
   "agents": {
     "defaults": {
-      "model": "llama3.1:8b",
-      "provider": "ollama"
+      "model": "gemini-2.0-flash",
+      "provider": "gemini"
     }
   }
 }
 ```
 
+**Three provider types are supported:**
+
+| Provider type | Detection | Endpoint |
+|---------------|-----------|----------|
+| **GeminiProvider** | Name contains `gemini` or URL contains `generativelanguage.googleapis.com` | `{baseUrl}/chat/completions` |
+| **OllamaProvider** | Name contains `ollama` or URL contains `/api/` | `{baseUrl}/api/chat` |
+| **OpenAICompatibleProvider** | Everything else (OpenAI, Anthropic, vLLM, etc.) | `{baseUrl}/v1/chat/completions` |
+
 | Provider field | Description |
 |----------------|-------------|
-| `baseUrl` | API base URL. Ollama uses `/api/chat`, others use `/v1/chat/completions` |
+| `baseUrl` | API base URL (path is appended automatically per provider type) |
 | `apiKey` | API key. Supports `${ENV_VAR}` expansion |
 | `model` | Model name/ID sent to the provider |
 | `phi_safe` | If `false`, PHI is redacted before sending messages to this provider |
@@ -290,30 +313,46 @@ Tools without a `params` key skip validation. Validation runs before criticality
 
 ### `config/channels.json` — Channel Capabilities
 
-Controls how responses are formatted per output channel.
+Controls how responses are formatted and which block types are supported per output channel.
 
 ```json
 {
   "channels": {
     "telegram": {
       "rich_text": true,
-      "buttons": false,
+      "buttons": true,
       "tables": false,
       "images": true,
-      "max_msg_length": 4096
+      "max_msg_length": 4096,
+      "parse_mode": "HTML",
+      "supported_blocks": ["data_table", "key_value", "alert", "text", "actions", "confirmation", "image", "chart", "waveform"]
     },
     "webchat": {
       "rich_text": true,
       "buttons": true,
       "tables": true,
       "images": true,
-      "max_msg_length": null
+      "max_msg_length": null,
+      "supported_blocks": ["data_table", "key_value", "alert", "text", "actions", "confirmation", "image", "chart", "waveform"]
+    },
+    "whatsapp": {
+      "rich_text": false,
+      "buttons": false,
+      "tables": false,
+      "images": true,
+      "max_msg_length": 4096,
+      "supported_blocks": ["data_table", "key_value", "alert", "text", "image"]
     }
   }
 }
 ```
 
-When `tables: false`, markdown tables are converted to plain text. When `max_msg_length` is set, responses are truncated.
+| Field | Description |
+|-------|-------------|
+| `tables` | When `false`, markdown tables in `response` text are converted to plain key:value lines |
+| `max_msg_length` | Truncates `response` text. `null` = no limit |
+| `parse_mode` | Telegram-specific: `"HTML"` for rich rendering |
+| `supported_blocks` | Block types this channel can render. Unsupported types are stripped from the `blocks` array before returning |
 
 ---
 
@@ -330,6 +369,7 @@ The gateway reads these from docker-compose (all have defaults):
 | `SCHEMA_PATH` | `/app/schema/init.sql` | SQL schema for DB init |
 | `SESSIONS_DIR` | `/data/sessions` | JSONL session persistence directory |
 | `CONSOLIDATION_THRESHOLD` | `30` | Messages before memory consolidation triggers |
+| `GEMINI_API_KEY` | (none) | Required if using Gemini provider (default) |
 | `OLLAMA_HOST` | `http://ollama:11434` | Ollama API endpoint (legacy, used by keyword fallback) |
 | `MONITORING_BASE` | `http://synthetic-monitoring:8000` | Vitals backend |
 | `EHR_BASE` | `http://synthetic-ehr:8080` | EHR/FHIR backend |
@@ -351,7 +391,7 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 
 | Domain | Tools | Backend |
 |--------|-------|---------|
-| **Monitoring** | `get_vitals`, `get_vitals_history`, `list_wards`, `list_doctors`, `get_ward_patients`, `get_doctor_patients`, `get_patient_events`, `get_event_vitals`, `get_event_ecg`, `initiate_code_blue` | synthetic-monitoring |
+| **Monitoring** | `get_vitals`, `get_vitals_history`, `get_vitals_trend`, `list_wards`, `list_doctors`, `get_ward_patients`, `get_doctor_patients`, `get_patient_events`, `get_event_vitals`, `get_event_ecg`, `initiate_code_blue` | synthetic-monitoring |
 | **EHR** | `get_patient`, `get_medications`, `get_allergies`, `get_orders`, `write_order` | synthetic-ehr (HAPI FHIR) |
 | **Radiology** | `get_studies`, `get_report`, `get_latest_study` | synthetic-radiology (Orthanc) |
 | **LIS** | `get_lab_results`, `get_lab_order`, `order_lab`, `get_order_status` | synthetic-lis |
@@ -367,12 +407,13 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 
 ### Multi-Provider LLM Routing
 
-The gateway supports multiple LLM backends through a provider abstraction layer (`providers.py`). Two provider types are built in:
+The gateway supports multiple LLM backends through a provider abstraction layer (`providers.py`). Three provider types are built in:
 
+- **GeminiProvider** — Google Gemini via its OpenAI-compatible endpoint (`{baseUrl}/chat/completions`)
 - **OllamaProvider** — local GPU inference via Ollama `/api/chat`
-- **OpenAICompatibleProvider** — any `/v1/chat/completions` API (OpenAI, Anthropic-compatible, vLLM, etc.)
+- **OpenAICompatibleProvider** — any `/v1/chat/completions` API (OpenAI, Anthropic, vLLM, etc.)
 
-Provider selection is global (configured in `config.json`). At runtime, the gateway checks provider health; if the default provider is down, the agent falls back to keyword-based intent detection.
+The default provider is **Gemini** (`gemini-2.0-flash`). Provider selection is configured in `config.json`. At runtime, the gateway checks provider health; if the default provider is down, the agent falls back to keyword-based intent detection.
 
 ### Session Persistence
 
@@ -412,9 +453,43 @@ Tokens are restored in the LLM response. Ollama (local) is marked `phi_safe: tru
 
 When no LLM provider is available, the agent uses regex-based intent detection to map messages to tools directly. Examples:
 - "vitals for P001" → `get_vitals(patient_id="P001")`
+- "vitals trend for P001" → `get_vitals_trend(patient_id="P001")`
+- "vitals trend over last 48 hours for P001" → `get_vitals_trend(patient_id="P001", hours=48)`
 - "list wards" → `list_wards()`
 - "lab results P001" → `get_lab_results(patient_id="P001")`
 - "blood availability" → `get_blood_availability()`
+
+### Vitals Trend Analysis with EWS Scoring
+
+The `get_vitals_trend` tool provides per-reading Early Warning Score (EWS) computation and statistical trend detection using linear regression (`scipy.stats.linregress`).
+
+**Query:** `"vitals trend over last 24 hours for P003"`
+
+**What it returns:**
+- 24 hourly readings with EWS score computed per reading (simplified NEWS2)
+- Trend classification: `deteriorating`, `improving`, or `stable`
+- Statistical metrics: slope, r², p-value, recent slope (last 3 readings)
+- Confidence level: `high` (r² > 0.5, p < 0.05) or `low`
+- Clinical interpretation string
+
+**Trend classification logic:**
+- **Deteriorating**: positive slope > 0.1 with p < 0.05
+- **Improving**: negative slope < -0.1 with p < 0.05
+- **Stable**: everything else
+
+**Rich blocks generated:**
+
+| Block | Content |
+|-------|---------|
+| `data_table` | Time, HR, BP Sys, SpO2, Temp, EWS per reading |
+| `chart` | EWS score line chart over time |
+| `text` | Trend status, confidence, clinical interpretation |
+| `alert` | Only if deteriorating — `critical` (high confidence) or `warning` (low confidence) |
+
+**Clinical scenarios (synthetic data):**
+- P003: deteriorating (HR 70→110, SpO2 98→92, temp 37→39)
+- P005: improving (HR 105→75, SpO2 93→98)
+- P001, P002, P004: random (stable)
 
 ---
 
@@ -425,6 +500,43 @@ Every tool call result is automatically parsed into structured **clinical facts*
 Supported fact types: `vitals`, `medication`, `allergy`, `lab_result`, `lab_order`, `demographics`, `order`, `imaging_study`, `radiology_report`, `blood_inventory`, `crossmatch`.
 
 Facts are injected into the LLM context for active patients, so the agent has full clinical history without re-querying backends.
+
+---
+
+## Structured Rich Responses
+
+The gateway returns structured `blocks` alongside the plain text `response`, enabling each client to render data natively. Blocks are generated from actual tool call results — when the LLM responds without making tool calls, `blocks` is `null`.
+
+### Block Types
+
+| Block Type | Description | Example Source |
+|------------|-------------|----------------|
+| `data_table` | Tabular data with columns + rows | Vitals, labs, medications, allergies, blood inventory, ward patients, imaging studies |
+| `key_value` | Key-value pairs | Patient demographics, radiology reports |
+| `alert` | Severity-tagged notification (`warning`, `critical`, `info`) | Abnormal vitals (NEWS), drug interactions |
+| `actions` | Clickable buttons that trigger tool calls | "View History", "Vitals", "Lab Results" |
+| `confirmation` | Critical action confirmation with button | Code blue, blood crossmatch, medication dispense |
+| `text` | Plain text content | Drug interaction "no results" |
+| `image` | Image reference (PNG/JPEG) with URL and alt text | X-ray images, radiology scans |
+| `chart` | Line/bar chart data with series | Vitals trend over time |
+| `waveform` | Time-series waveform data with lead channels | ECG waveforms |
+
+### Channel Rendering
+
+Blocks are rendered differently per channel:
+
+| Channel | `data_table` | `actions` | `alert` | `image` | `chart`/`waveform` |
+|---------|-------------|-----------|---------|---------|-------------------|
+| **webchat** | Passed through as-is (frontend renders) | Passed through | Passed through | Passed through | Passed through |
+| **telegram** | HTML `<b>` title + key:value pairs | `InlineKeyboardMarkup` buttons | Emoji + bold HTML | `reply_photo()` | Text fallback (data in webchat) |
+| **slack** | Block Kit `section` with mrkdwn | Block Kit `button` elements | mrkdwn with `:warning:` | Block Kit `image` | Not supported |
+| **whatsapp** | Plain text with bold title | Numbered list | Plain text | Image URL | Not supported |
+
+Unsupported block types are filtered per channel via `supported_blocks` in `config/channels.json`.
+
+### Button Callbacks (Telegram)
+
+Action buttons route through `/chat` as synthetic messages (e.g. "View History P001"), preserving the audit trail and allowing the LLM to enrich responses. Confirmation buttons POST directly to `/confirm/{id}`.
 
 ---
 
@@ -453,17 +565,18 @@ hobot/
 ├── nanobot/                  # Gateway (FastAPI, port 3000)
 │   ├── main.py              # App + endpoints (/chat, /chat/stream, /health, /confirm)
 │   ├── agent.py             # Agent loop (multi-provider + consolidation + streaming)
-│   ├── providers.py         # LLM provider abstraction (Ollama, OpenAI-compatible)
+│   ├── providers.py         # LLM provider abstraction (Gemini, Ollama, OpenAI-compatible)
 │   ├── tools.py             # Tool registry + param validation + HTTP dispatch + critical gate
 │   ├── audit.py             # SQLite audit logging
 │   ├── clinical_memory.py   # Fact extraction + storage
 │   ├── session.py           # JSONL-backed session persistence
-│   ├── formatter.py         # Channel-aware response formatting
+│   ├── formatter.py         # Channel-aware response formatting + rich block rendering
+│   ├── blocks.py            # Tool result → abstract UI block mappers
 │   ├── phi.py               # PHI redaction/restoration
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── telegram-bot/              # Telegram bot bridge (polling)
-│   ├── bot.py               # Forwards messages to gateway /chat
+│   ├── bot.py               # Rich rendering + inline keyboards + callback handler
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── mcp-*/                    # MCP tool servers (8 services)
@@ -487,12 +600,11 @@ hobot/
 # 1. Clone
 git clone <repo-url> && cd hobot
 
-# 2. (Optional) Configure cloud provider keys
-export ANTHROPIC_API_KEY=sk-ant-...
+# 2. Set Gemini API key (default provider)
+export GEMINI_API_KEY=your-gemini-api-key
 
-# 3. Start Ollama and pull the model
-docker compose up ollama -d
-docker compose exec ollama ollama pull llama3.1:8b
+# 3. (Optional) Configure other provider keys
+export ANTHROPIC_API_KEY=sk-ant-...
 
 # 4. Build and start the full stack
 docker compose up -d --build
@@ -501,6 +613,8 @@ docker compose up -d --build
 # 5. Verify
 curl http://localhost:3000/health
 ```
+
+To use Ollama (local GPU) instead of Gemini, see [Change the Default LLM Model](#change-the-default-llm-model).
 
 ### Start
 
@@ -545,52 +659,38 @@ docker compose up -d --build
 
 ### Change the Default LLM Model
 
-Edit `config/config.json`:
+Edit `agents.defaults` in `config/config.json`:
 
 ```json
 {
-  "providers": {
-    "ollama": {
-      "baseUrl": "http://ollama:11434",
-      "model": "llama3.2-vision",
-      "phi_safe": true
-    }
-  },
   "agents": {
     "defaults": {
-      "provider": "ollama"
+      "model": "gemini-2.0-flash",
+      "provider": "gemini"
     }
   }
 }
 ```
 
-Then pull the model and restart:
+Then restart: `docker compose restart nanobot-gateway`
+
+**Switch to Ollama (local GPU):**
 
 ```bash
-docker compose exec ollama ollama pull llama3.2-vision
-docker compose restart nanobot-gateway
+# Pull the model first
+docker compose up ollama -d
+docker compose exec ollama ollama pull qwen2.5:7b
 ```
 
-### Switch to a Cloud Provider
+Set `"provider": "ollama"` in config and restart. Ollama is `phi_safe: true` — no PHI redaction needed.
 
-Set the API key and change the default provider in `config/config.json`:
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "provider": "anthropic"
-    }
-  }
-}
-```
+**Switch to Anthropic:**
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-docker compose up -d nanobot-gateway
 ```
 
-PHI redaction activates automatically for providers with `"phi_safe": false`.
+Set `"provider": "anthropic"` in config and restart. PHI redaction activates automatically for providers with `"phi_safe": false`.
 
 ### Verify Session Persistence
 
@@ -661,13 +761,13 @@ curl -s -X POST http://localhost:3000/chat \
 | Step | Logger | What you see |
 |------|--------|--------------|
 | 1. Request received | `nanobot` | FastAPI access log: `POST /chat` |
-| 2. Provider health check | `nanobot.providers` | `HTTP Request: GET http://ollama:11434/api/tags` (skipped if cached) |
-| 3. LLM inference | `httpx` | `HTTP Request: POST http://ollama:11434/api/chat "HTTP/1.1 200 OK"` |
+| 2. Provider health check | `nanobot.providers` | `GET {provider}/models` (skipped if cached within 30s TTL) |
+| 3. LLM inference | `httpx` | `POST {provider}/chat/completions "HTTP/1.1 200 OK"` |
 | 4. Tool dispatch | `httpx` | `HTTP Request: GET http://synthetic-monitoring:8000/vitals/P001` |
-| 5. LLM synthesis | `httpx` | Second `POST .../api/chat` (LLM summarizes tool result) |
+| 5. LLM synthesis | `httpx` | Second `POST .../chat/completions` (LLM summarizes tool result) |
 | 6. Response returned | `nanobot` | FastAPI response log |
 
-If Ollama is down, steps 2-5 are replaced by keyword fallback (no `httpx` LLM calls, just the backend tool call).
+If the LLM provider is down, steps 2-5 are replaced by keyword fallback (no LLM calls, just the backend tool call).
 
 ### Using the Streaming Endpoint for Tracing
 
@@ -754,7 +854,8 @@ docker compose exec nanobot-gateway head -1 /data/sessions/T1/<session_id>.jsonl
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `"status":"degraded"` in `/health` | One or more backends down | Check `docker compose ps`, restart failed service |
-| All responses are keyword-formatted JSON | LLM provider unreachable | Check `docker compose logs ollama`, verify model is pulled |
+| All responses are keyword-formatted JSON | LLM provider unreachable | Check provider logs; for Gemini verify `GEMINI_API_KEY` is set; for Ollama check model is pulled |
+| `OpenAI-compatible chat failed` in logs | Cloud provider error (rate limit, auth, timeout) | Check API key, quota, and `docker compose logs nanobot-gateway` |
 | `Ollama chat failed` in logs | Model not loaded or OOM | `docker compose exec ollama ollama list`, check GPU memory |
 | `Invalid parameters:` error returned | Tool params failed validation | Check params against schema in `config/tools.json` |
 | Session not found after restart | Wrong `tenant_id` on follow-up request | `tenant_id` is part of the session path; must match |
@@ -780,11 +881,82 @@ Connect Hobot to Telegram so clinicians can chat from their phone.
 
 The bot uses long-polling (no public URL or webhook required). Sessions are keyed by Telegram chat ID (`tg-<chat_id>`), so each chat maintains its own conversation history.
 
+**Rich rendering:** When the gateway returns `blocks`, the bot renders them natively:
+- `data_table` / `key_value` / `alert` → HTML-formatted messages (`parse_mode="HTML"`)
+- `actions` → Telegram `InlineKeyboardMarkup` with callback buttons
+- `confirmation` → Warning message with "Confirm" inline button
+- `image` → `reply_photo()` with caption
+- `chart` / `waveform` → Text fallback (full data available in webchat)
+
+Button presses are handled via `CallbackQueryHandler`: action buttons send a synthetic message to `/chat`; confirmation buttons POST to `/confirm/{id}`.
+
 | Variable | Required | Default |
 |----------|----------|---------|
 | `TELEGRAM_BOT_TOKEN` | yes | — |
 | `GATEWAY_URL` | no | `http://nanobot-gateway:3000` |
 | `TENANT_ID` | no | `default` |
+
+### Telegram Bot Examples
+
+**Vitals query** — renders as HTML table with alert and "View History" button:
+
+```
+User: Show vitals for P001
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ <b>Vitals — P001</b>            │
+│ Heart Rate: 82 bpm              │
+│ Blood Pressure: 145/92 mmHg     │
+│ SpO2: 97 %                      │
+│ Temperature: 37.2 °C            │
+│ Respiratory Rate: 18 breaths/min│
+│                                  │
+│ ⚠️ <b>Blood Pressure abnormal</b>│
+│                                  │
+│ [View History]  ← inline button │
+└──────────────────────────────────┘
+```
+
+Tapping **View History** sends a synthetic message `"Show vitals history for P001"` to the gateway, returning a trend chart block.
+
+**Blood availability** — data table rendered as HTML:
+
+```
+User: blood availability
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ <b>Blood Availability</b>       │
+│ A+: 45 units                    │
+│ A-: 12 units                    │
+│ B+: 38 units                    │
+│ B-: 8 units                     │
+│ O+: 52 units                    │
+│ O-: 15 units                    │
+│ AB+: 20 units                   │
+│ AB-: 5 units                    │
+└──────────────────────────────────┘
+```
+
+**Code blue** — confirmation block with inline "Confirm" button:
+
+```
+User: code blue for P001
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ ⚠️ <b>Confirm Critical Action</b>│
+│ initiate_code_blue               │
+│ Patient: P001                    │
+│                                  │
+│ [✅ Confirm]  ← inline button    │
+└──────────────────────────────────┘
+```
+
+Tapping **Confirm** POSTs to `/confirm/{id}` and the bot replies with the execution result.
+
+**Action buttons** — any `actions` block renders as inline keyboard buttons. Each button triggers a new query to the gateway when tapped, keeping the full conversation in the audit trail.
 
 ---
 

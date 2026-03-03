@@ -2,24 +2,39 @@
   "channels": {
     "telegram": {
       "rich_text": true,
-      "buttons": false,
+      "buttons": true,
       "tables": false,
       "images": true,
-      "max_msg_length": 4096
+      "max_msg_length": 4096,
+      "parse_mode": "HTML",
+      "supported_blocks": ["data_table", "key_value", "alert", "text", "actions", "confirmation", "image", "chart", "waveform"],
+      "render_as_image": ["chart", "waveform"]
     },
     "webchat": {
       "rich_text": true,
       "buttons": true,
       "tables": true,
       "images": true,
-      "max_msg_length": null
+      "max_msg_length": null,
+      "supported_blocks": ["data_table", "key_value", "alert", "text", "actions", "confirmation", "image", "chart", "waveform"]
     },
     "slack": {
       "rich_text": true,
       "buttons": true,
       "tables": true,
       "images": true,
-      "max_msg_length": 40000
+      "max_msg_length": 40000,
+      "supported_blocks": ["data_table", "key_value", "alert", "text", "actions", "image"],
+      "render_as_image": ["chart", "waveform", "data_table"]
+    },
+    "whatsapp": {
+      "rich_text": false,
+      "buttons": false,
+      "tables": false,
+      "images": true,
+      "max_msg_length": 4096,
+      "supported_blocks": ["data_table", "key_value", "alert", "text", "image"],
+      "render_as_image": ["chart", "waveform", "data_table"]
     }
   }
 }

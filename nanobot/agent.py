@@ -6,6 +6,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import audit
@@ -14,6 +15,13 @@ import phi
 from providers import get_provider
 from session import Session
 from tools import call_tool, get_tool_list
+
+
+@dataclass
+class AgentResult:
+    """Structured result from the agent loop."""
+    text: str
+    tool_results: list[dict] = field(default_factory=list)
 
 logger = logging.getLogger("nanobot.agent")
 
@@ -50,6 +58,9 @@ def _build_system_prompt() -> str:
 # ---------------------------------------------------------------------------
 
 _INTENT_PATTERNS: list[tuple[re.Pattern, str, callable]] = [
+    (re.compile(r"vitals?\s+trend\s+(?:(?:over\s+)?(?:the\s+)?last\s+(\d+)\s+hours?\s+)?(?:for\s+)?(\w+)", re.I),
+     "get_vitals_trend",
+     lambda m: {"patient_id": m.group(2), **({"hours": int(m.group(1))} if m.group(1) else {})}),
     (re.compile(r"vitals?\s+(?:for\s+)?(\w+)", re.I), "get_vitals", lambda m: {"patient_id": m.group(1)}),
     (re.compile(r"vitals?\s+history\s+(?:for\s+)?(\w+)", re.I), "get_vitals_history", lambda m: {"patient_id": m.group(1)}),
     (re.compile(r"medications?\s+(?:for\s+)?(\w+)", re.I), "get_medications", lambda m: {"patient_id": m.group(1)}),
@@ -72,7 +83,12 @@ def _detect_intent(message: str) -> tuple[str, dict] | None:
     for pattern, tool_name, extract in _INTENT_PATTERNS:
         match = pattern.search(message)
         if match:
-            return tool_name, extract(match)
+            params = extract(match)
+            # Normalize IDs to uppercase (backend is case-sensitive)
+            for key in ("patient_id", "ward_id", "doctor_id"):
+                if key in params:
+                    params[key] = params[key].upper()
+            return tool_name, params
     return None
 
 
@@ -193,8 +209,8 @@ async def _post_tool_hooks(tool_name: str, tool_result: dict, params: dict, sess
 # Agent loop (F4 — provider-routed)
 # ---------------------------------------------------------------------------
 
-async def run_agent(user_message: str, session: Session) -> str:
-    """Process a user message through the agent loop. Returns response text."""
+async def run_agent(user_message: str, session: Session) -> AgentResult:
+    """Process a user message through the agent loop. Returns AgentResult."""
     session.append_message("user", user_message)
     t0 = time.time()
 
@@ -222,11 +238,11 @@ async def run_agent(user_message: str, session: Session) -> str:
         model=provider.config.model if provider_available else None,
     )
 
-    session.append_message("assistant", result)
+    session.append_message("assistant", result.text)
     return result
 
 
-async def _run_with_provider(user_message: str, session: Session, provider) -> str:
+async def _run_with_provider(user_message: str, session: Session, provider) -> AgentResult:
     """Agent loop using an LLM provider for intent + synthesis."""
     # Build clinical context from active patients
     clinical_context = ""
@@ -248,6 +264,8 @@ async def _run_with_provider(user_message: str, session: Session, provider) -> s
     if not provider.config.phi_safe:
         messages, phi_mapping = _redact_messages(messages)
 
+    collected_tool_results: list[dict] = []
+
     for _ in range(MAX_ITERATIONS):
         content = await provider.chat(messages)
         if content is None:
@@ -266,6 +284,8 @@ async def _run_with_provider(user_message: str, session: Session, provider) -> s
             tool_result = await call_tool(tool_name, params, session)
             await _post_tool_hooks(tool_name, tool_result, params, session, provider.config.name)
 
+            collected_tool_results.append({"tool": tool_name, "params": params, "data": tool_result})
+
             messages.append({"role": "assistant", "content": content})
             tool_msg = f"Tool result for {tool_name}:\n{json.dumps(tool_result, indent=2)}"
             if phi_mapping:
@@ -274,17 +294,20 @@ async def _run_with_provider(user_message: str, session: Session, provider) -> s
             messages.append({"role": "user", "content": tool_msg})
             continue
 
-        return content
+        return AgentResult(text=content, tool_results=collected_tool_results)
 
-    return "I've reached the maximum number of steps for this request. Please try a more specific query."
+    return AgentResult(
+        text="I've reached the maximum number of steps for this request. Please try a more specific query.",
+        tool_results=collected_tool_results,
+    )
 
 
-async def _run_with_keywords(user_message: str, session: Session) -> str:
+async def _run_with_keywords(user_message: str, session: Session) -> AgentResult:
     """Fallback: keyword-based intent detection and direct tool dispatch."""
     intent = _detect_intent(user_message)
     if intent is None:
-        return (
-            "I couldn't determine what you're looking for. "
+        return AgentResult(
+            text="I couldn't determine what you're looking for. "
             "Try asking about vitals, medications, allergies, lab results, "
             "ward patients, blood availability, or inventory."
         )
@@ -297,15 +320,21 @@ async def _run_with_keywords(user_message: str, session: Session) -> str:
     tool_result = await call_tool(tool_name, params, session)
     await _post_tool_hooks(tool_name, tool_result, params, session, None)
 
+    collected = [{"tool": tool_name, "params": params, "data": tool_result}]
+
     if "error" in tool_result:
-        return f"Error from {tool_name}: {tool_result['error']}"
+        return AgentResult(text=f"Error from {tool_name}: {tool_result['error']}", tool_results=collected)
     if "status" in tool_result and tool_result["status"] == "awaiting_confirmation":
-        return (
+        text = (
             f"This is a critical action ({tool_name}) that requires confirmation.\n"
             f"Confirmation ID: {tool_result['confirmation_id']}\n"
             f"{tool_result['message']}"
         )
-    return f"**{tool_name}** result:\n```json\n{json.dumps(tool_result, indent=2)}\n```"
+        return AgentResult(text=text, tool_results=collected)
+    return AgentResult(
+        text=f"**{tool_name}** result:\n```json\n{json.dumps(tool_result, indent=2)}\n```",
+        tool_results=collected,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +355,8 @@ async def run_agent_stream(user_message: str, session: Session) -> AsyncIterator
     if not provider_available:
         # Keyword fallback — single text event
         result = await _run_with_keywords(user_message, session)
-        session.append_message("assistant", result)
-        yield {"type": "text", "content": result}
+        session.append_message("assistant", result.text)
+        yield {"type": "text", "content": result.text}
         yield {"type": "done", "session_id": session.id}
         return
 
@@ -354,8 +383,8 @@ async def run_agent_stream(user_message: str, session: Session) -> AsyncIterator
         content = await provider.chat(messages)
         if content is None:
             result = await _run_with_keywords(user_message, session)
-            session.append_message("assistant", result)
-            yield {"type": "text", "content": result}
+            session.append_message("assistant", result.text)
+            yield {"type": "text", "content": result.text}
             yield {"type": "done", "session_id": session.id}
             return
 

@@ -44,6 +44,13 @@
         "patient_id": {"type": "string", "required": true}
       }
     },
+    "get_vitals_trend": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true},
+        "hours": {"type": "number"}
+      }
+    },
     "list_wards": { "critical": false },
     "list_doctors": { "critical": false },
     "get_ward_patients": {

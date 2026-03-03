@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import h5py
 import numpy as np
+from scipy.stats import linregress
 from fastapi import FastAPI, HTTPException, Query
 
 from hdf5_generator import DATA_DIR, ECG_LEADS, generate_all
@@ -13,7 +14,7 @@ from hdf5_generator import DATA_DIR, ECG_LEADS, generate_all
 # ---------------------------------------------------------------------------
 
 PATIENT_IDS = ["P001", "P002", "P003", "P004", "P005"]
-NUM_READINGS = 10
+NUM_READINGS = 24
 
 
 def _random_vitals() -> dict:
@@ -39,9 +40,52 @@ def _generate_history(n: int) -> list[dict]:
     return readings
 
 
+def _generate_deteriorating(n: int) -> list[dict]:
+    """Generate deteriorating vitals: HR rising, SpO2 dropping, temp rising."""
+    now = datetime.now(timezone.utc)
+    readings = []
+    for i in range(n):
+        frac = i / max(n - 1, 1)
+        ts = now - timedelta(hours=24 * (n - 1 - i) / max(n - 1, 1))
+        readings.append({
+            "timestamp": ts.isoformat(),
+            "heart_rate": int(70 + 40 * frac + random.gauss(0, 2)),
+            "bp_systolic": random.randint(100, 140),
+            "bp_diastolic": random.randint(60, 90),
+            "spo2": int(98 - 6 * frac + random.gauss(0, 0.5)),
+            "temperature": round(37.0 + 2.0 * frac + random.gauss(0, 0.1), 1),
+        })
+    return readings
+
+
+def _generate_improving(n: int) -> list[dict]:
+    """Generate improving vitals: HR falling, SpO2 rising."""
+    now = datetime.now(timezone.utc)
+    readings = []
+    for i in range(n):
+        frac = i / max(n - 1, 1)
+        ts = now - timedelta(hours=24 * (n - 1 - i) / max(n - 1, 1))
+        readings.append({
+            "timestamp": ts.isoformat(),
+            "heart_rate": int(105 - 30 * frac + random.gauss(0, 2)),
+            "bp_systolic": random.randint(100, 140),
+            "bp_diastolic": random.randint(60, 90),
+            "spo2": int(93 + 5 * frac + random.gauss(0, 0.5)),
+            "temperature": round(random.uniform(36.5, 37.5), 1),
+        })
+    return readings
+
+
+# Clinical scenario map: patient_id -> generator
+_SCENARIO_GENERATORS: dict[str, callable] = {
+    "P003": _generate_deteriorating,
+    "P005": _generate_improving,
+}
+
 # In-memory store: patient_id -> list of readings (oldest first)
 VITALS_DB: dict[str, list[dict]] = {
-    pid: _generate_history(NUM_READINGS) for pid in PATIENT_IDS
+    pid: _SCENARIO_GENERATORS.get(pid, _generate_history)(NUM_READINGS)
+    for pid in PATIENT_IDS
 }
 
 # ---------------------------------------------------------------------------
@@ -178,6 +222,89 @@ def get_vitals_history(patient_id: str):
     if history is None:
         raise HTTPException(status_code=404, detail=f"Patient {patient_id} not found")
     return {"patient_id": patient_id, "readings": history}
+
+
+# ---------------------------------------------------------------------------
+# Vitals trend analysis
+# ---------------------------------------------------------------------------
+
+def analyze_trend(readings: list[dict], hours: int = 24) -> dict:
+    """Filter readings by time window, compute EWS per reading, run linear regression."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    filtered = []
+    for r in readings:
+        ts = datetime.fromisoformat(r["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts >= cutoff:
+            filtered.append({**r, "_ts": ts})
+
+    if len(filtered) < 2:
+        return {"error": f"Need at least 2 readings in the last {hours}h, got {len(filtered)}"}
+
+    # Compute EWS per reading
+    scored_readings = []
+    ews_scores = []
+    for r in filtered:
+        ews = compute_news(r)
+        entry = {k: v for k, v in r.items() if k != "_ts"}
+        entry["ews_score"] = ews
+        scored_readings.append(entry)
+        ews_scores.append(ews)
+
+    # Hours elapsed from first reading for regression x-axis
+    t0 = filtered[0]["_ts"]
+    hours_elapsed = [(r["_ts"] - t0).total_seconds() / 3600.0 for r in filtered]
+
+    # Linear regression on EWS scores
+    result = linregress(hours_elapsed, ews_scores)
+    slope, r_squared, p_value = result.slope, result.rvalue ** 2, result.pvalue
+
+    # Recent slope from last 3 readings
+    recent_slope = 0.0
+    if len(ews_scores) >= 3:
+        recent_x = hours_elapsed[-3:]
+        recent_y = ews_scores[-3:]
+        recent_result = linregress(recent_x, recent_y)
+        recent_slope = recent_result.slope
+
+    # Classify trend
+    if slope > 0.1 and p_value < 0.05:
+        status = "deteriorating"
+    elif slope < -0.1 and p_value < 0.05:
+        status = "improving"
+    else:
+        status = "stable"
+
+    confidence = "high" if r_squared > 0.5 and p_value < 0.05 else "low"
+
+    avg_ews = round(sum(ews_scores) / len(ews_scores), 1)
+    latest_ews = ews_scores[-1]
+    interpretation = f"Average EWS: {avg_ews}, Latest: {latest_ews}. EWS {status}."
+
+    return {
+        "readings": scored_readings,
+        "trend": {
+            "patient_status": status,
+            "confidence": confidence,
+            "slope": round(slope, 4),
+            "r_squared": round(r_squared, 4),
+            "p_value": round(p_value, 4),
+            "recent_slope": round(recent_slope, 4),
+            "clinical_interpretation": interpretation,
+        },
+    }
+
+
+@app.get("/vitals/{patient_id}/trend")
+def get_vitals_trend(patient_id: str, hours: int = Query(default=24, ge=1, le=168)):
+    history = VITALS_DB.get(patient_id)
+    if history is None:
+        raise HTTPException(status_code=404, detail=f"Patient {patient_id} not found")
+    result = analyze_trend(history, hours)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"patient_id": patient_id, "hours": hours, **result}
 
 
 # ---------------------------------------------------------------------------

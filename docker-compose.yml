@@ -36,6 +36,8 @@ services:
       - PATIENT_SERVICES_BASE=http://synthetic-patient-services:8000
       - SESSIONS_DIR=/data/sessions
       - CONFIG_PATH=/app/config/config.json
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
 
   # --- Telegram Bot ---
   telegram-bot:

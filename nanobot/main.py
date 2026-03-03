@@ -61,6 +61,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     session_id: str
+    blocks: list[dict] | None = None
 
 
 class ConfirmResponse(BaseModel):
@@ -115,10 +116,14 @@ async def chat(request: ChatRequest):
         channel=request.channel,
     )
 
-    raw_response = await run_agent(request.message, sess)
-    formatted = formatter.format_response(raw_response, request.channel)
+    agent_result = await run_agent(request.message, sess)
+    rich = formatter.format_rich_response(agent_result, request.channel)
 
-    return ChatResponse(response=formatted, session_id=sess.id)
+    return ChatResponse(
+        response=rich["text"],
+        session_id=sess.id,
+        blocks=rich["blocks"],
+    )
 
 
 @app.post("/chat/stream")

@@ -89,15 +89,26 @@ class OllamaProvider(LLMProvider):
 
 
 class OpenAICompatibleProvider(LLMProvider):
-    async def chat(self, messages: list[dict]) -> str | None:
-        headers = {"Content-Type": "application/json"}
+    """Provider for any OpenAI-compatible API (OpenAI, Anthropic, vLLM, etc.)."""
+
+    def _chat_url(self) -> str:
+        return f"{self.config.base_url}/v1/chat/completions"
+
+    def _models_url(self) -> str:
+        return f"{self.config.base_url}/v1/models"
+
+    def _auth_headers(self) -> dict:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
+        return headers
+
+    async def chat(self, messages: list[dict]) -> str | None:
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
                 resp = await client.post(
-                    f"{self.config.base_url}/v1/chat/completions",
-                    headers=headers,
+                    self._chat_url(),
+                    headers=self._auth_headers(),
                     json={
                         "model": self.config.model,
                         "messages": messages,
@@ -116,18 +127,25 @@ class OpenAICompatibleProvider(LLMProvider):
         yield ""
 
     async def _check_health(self) -> bool:
-        headers = {}
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(
-                    f"{self.config.base_url}/v1/models",
-                    headers=headers,
+                    self._models_url(),
+                    headers=self._auth_headers(),
                 )
                 return resp.status_code == 200
         except Exception:
             return False
+
+
+class GeminiProvider(OpenAICompatibleProvider):
+    """Google Gemini via its OpenAI-compatible endpoint."""
+
+    def _chat_url(self) -> str:
+        return f"{self.config.base_url}/chat/completions"
+
+    def _models_url(self) -> str:
+        return f"{self.config.base_url}/models"
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +191,11 @@ def load_providers(config_path: str) -> None:
             phi_safe=phi_safe,
             timeout=timeout,
         )
-        # Ollama has /api/chat endpoint, others use OpenAI-compatible
+        # Route to correct provider class based on name/URL
         if "ollama" in name.lower() or "/api/" in base_url:
             _providers[name] = OllamaProvider(config)
+        elif "gemini" in name.lower() or "generativelanguage.googleapis.com" in base_url:
+            _providers[name] = GeminiProvider(config)
         else:
             _providers[name] = OpenAICompatibleProvider(config)
 
