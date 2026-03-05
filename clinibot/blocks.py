@@ -316,10 +316,11 @@ def _build_vitals_trend_blocks(data: dict, params: dict) -> list[dict]:
     readings = data.get("readings", [])
     trend = data.get("trend", {})
     pid = data.get("patient_id", params.get("patient_id", ""))
+    display = params.get("display", "chart")
     blocks: list[dict] = []
 
-    # Data table with EWS column
-    if readings:
+    # Data table — only in raw mode
+    if display == "raw" and readings:
         rows = []
         for r in readings:
             rows.append([
@@ -338,20 +339,32 @@ def _build_vitals_trend_blocks(data: dict, params: dict) -> list[dict]:
             "rows": rows,
         })
 
-    # Chart block (EWS trend line)
-    if len(readings) >= 2:
+    # Chart block — only in chart mode, with all vitals series
+    if display == "chart" and len(readings) >= 2:
         series = {
-            "ews_score": [
-                {"t": r.get("timestamp", ""), "v": r.get("ews_score")}
-                for r in readings if r.get("ews_score") is not None
+            "heart_rate": [
+                {"t": r.get("timestamp", ""), "v": r.get("heart_rate")}
+                for r in readings if r.get("heart_rate") is not None
+            ],
+            "bp_systolic": [
+                {"t": r.get("timestamp", ""), "v": r.get("bp_systolic")}
+                for r in readings if r.get("bp_systolic") is not None
+            ],
+            "spo2": [
+                {"t": r.get("timestamp", ""), "v": r.get("spo2")}
+                for r in readings if r.get("spo2") is not None
+            ],
+            "temperature": [
+                {"t": r.get("timestamp", ""), "v": r.get("temperature")}
+                for r in readings if r.get("temperature") is not None
             ],
         }
         blocks.append({
             "type": "chart",
             "chart_type": "line",
-            "title": f"EWS Trend — {pid}",
+            "title": f"Vitals Trend — {pid}",
             "x_label": "Time",
-            "y_label": "EWS Score",
+            "y_label": "Value",
             "series": series,
         })
 
@@ -429,6 +442,77 @@ def _build_studies_blocks(data: dict, params: dict) -> list[dict]:
     }]
 
 
+def _build_ward_rounds_blocks(data: dict, params: dict) -> list[dict]:
+    """Build per-patient key_value blocks for ward rounds."""
+    if "error" in data:
+        return []
+    patients = data.get("patients", [])
+    if not patients:
+        return []
+    ward_id = data.get("ward_id", params.get("ward_id", ""))
+    blocks: list[dict] = []
+    for p in patients:
+        vitals = p.get("vitals", {})
+        meds = p.get("medications", [])
+        meds_summary = ", ".join(m.get("medication", "") for m in meds[:3]) or "None"
+        scan = p.get("latest_scan")
+        scan_desc = scan.get("description", "N/A") if scan else "None"
+        news = p.get("news_score", 0)
+        items = [
+            {"key": "Bed", "value": p.get("bed", "N/A")},
+            {"key": "NEWS", "value": str(news)},
+            {"key": "HR", "value": str(vitals.get("heart_rate", ""))},
+            {"key": "BP", "value": f"{vitals.get('bp_systolic', '')}/{vitals.get('bp_diastolic', '')}"},
+            {"key": "SpO2", "value": str(vitals.get("spo2", ""))},
+            {"key": "Temp", "value": str(vitals.get("temperature", ""))},
+            {"key": "Doctor", "value": p.get("doctor", "N/A")},
+            {"key": "Meds", "value": meds_summary},
+            {"key": "Last Scan", "value": scan_desc},
+        ]
+        blocks.append({
+            "type": "key_value",
+            "title": f"{p.get('patient_id', '')} — Ward {ward_id}",
+            "items": items,
+        })
+        if news >= 5:
+            blocks.append({
+                "type": "alert",
+                "severity": "warning",
+                "text": f"Patient {p.get('patient_id', '')} NEWS={news} — needs urgent review",
+            })
+    return blocks
+
+
+def _build_resolve_bed_blocks(data: dict, params: dict) -> list[dict]:
+    if "error" in data:
+        return []
+    return [{"type": "text", "content": f"Bed {data.get('bed_id', '')} → Patient {data.get('patient_id', '')}"}]
+
+
+def _build_schedule_blocks(data: dict, params: dict) -> list[dict]:
+    if "error" in data:
+        return []
+    items = [
+        {"key": "ID", "value": data.get("appointment_id", "")},
+        {"key": "Patient", "value": data.get("patient_id", "")},
+        {"key": "Doctor", "value": data.get("doctor", "")},
+        {"key": "When", "value": data.get("datetime", "")},
+        {"key": "Status", "value": data.get("status", "")},
+    ]
+    return [{"type": "key_value", "title": "Appointment Scheduled", "items": items}]
+
+
+def _build_reminder_blocks(data: dict, params: dict) -> list[dict]:
+    if "error" in data:
+        return []
+    items = [
+        {"key": "ID", "value": data.get("reminder_id", "")},
+        {"key": "Message", "value": data.get("message", "")},
+        {"key": "Fires at", "value": data.get("trigger_at", "")},
+    ]
+    return [{"type": "key_value", "title": "Reminder Set", "items": items}]
+
+
 # ---------------------------------------------------------------------------
 # Tool → builder mapping
 # ---------------------------------------------------------------------------
@@ -446,5 +530,10 @@ TOOL_BLOCK_MAP: dict[str, callable] = {
     "check_drug_interactions": _build_drug_interactions_blocks,
     "get_studies": _build_studies_blocks,
     "get_event_ecg": _build_ecg_blocks,
+    "get_latest_ecg": _build_ecg_blocks,
     "get_report": _build_report_blocks,
+    "get_ward_rounds": _build_ward_rounds_blocks,
+    "resolve_bed": _build_resolve_bed_blocks,
+    "schedule_appointment": _build_schedule_blocks,
+    "set_reminder": _build_reminder_blocks,
 }

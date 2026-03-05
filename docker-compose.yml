@@ -1,7 +1,7 @@
 services:
   # --- Core ---
-  nanobot-gateway:
-    build: ./nanobot
+  clinibot-gateway:
+    build: ./clinibot
     depends_on:
       - ollama
       - mcp-ehr
@@ -38,14 +38,15 @@ services:
       - CONFIG_PATH=/app/config/config.json
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 
   # --- Telegram Bot ---
   telegram-bot:
     build: ./telegram-bot
-    depends_on: [nanobot-gateway]
+    depends_on: [clinibot-gateway]
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - GATEWAY_URL=http://nanobot-gateway:3000
+      - GATEWAY_URL=http://clinibot-gateway:3000
       - TENANT_ID=default
     restart: unless-stopped
 

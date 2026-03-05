@@ -83,6 +83,12 @@
         "event_id": {"type": "string", "required": true}
       }
     },
+    "get_latest_ecg": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true}
+      }
+    },
     "get_patient": {
       "critical": false,
       "params": {
@@ -151,7 +157,12 @@
         "order_id": {"type": "string", "required": true}
       }
     },
-    "check_drug_interactions": { "critical": false },
+    "check_drug_interactions": {
+      "critical": false,
+      "params": {
+        "drugs": {"type": "string", "required": true}
+      }
+    },
     "get_blood_availability": { "critical": false },
     "get_crossmatch_status": {
       "critical": false,
@@ -166,13 +177,62 @@
         "equipment_id": {"type": "string", "required": true}
       }
     },
-    "place_supply_order": { "critical": false },
-    "request_housekeeping": { "critical": false },
-    "order_diet": { "critical": false },
+    "place_supply_order": {
+      "critical": false,
+      "params": {
+        "item": {"type": "string", "required": true},
+        "quantity": {"type": "number", "required": true}
+      }
+    },
+    "request_housekeeping": {
+      "critical": false,
+      "params": {
+        "room": {"type": "string", "required": true},
+        "request_type": {"type": "string", "required": true},
+        "priority": {"type": "string", "enum": ["normal", "urgent"]}
+      }
+    },
+    "order_diet": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true},
+        "diet_type": {"type": "string", "required": true},
+        "meal": {"type": "string", "required": true},
+        "restrictions": {"type": "string"}
+      }
+    },
     "get_request_status": {
       "critical": false,
       "params": {
         "request_id": {"type": "string", "required": true}
+      }
+    },
+    "get_ward_rounds": {
+      "critical": false,
+      "params": {
+        "ward_id": {"type": "string", "required": true}
+      }
+    },
+    "resolve_bed": {
+      "critical": false,
+      "params": {
+        "bed_id": {"type": "string", "required": true}
+      }
+    },
+    "schedule_appointment": {
+      "critical": false,
+      "params": {
+        "patient_id": {"type": "string", "required": true},
+        "doctor": {"type": "string", "required": true},
+        "datetime": {"type": "string", "required": true},
+        "notes": {"type": "string"}
+      }
+    },
+    "set_reminder": {
+      "critical": false,
+      "params": {
+        "message": {"type": "string", "required": true},
+        "delay_minutes": {"type": "number", "required": true}
       }
     }
   }

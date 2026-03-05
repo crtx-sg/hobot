@@ -104,6 +104,13 @@ DOCTOR_MAP: dict[str, list[str]] = {
     "DR-PATEL": ["P005"],
 }
 
+# Bed mapping (static seed data)
+BED_MAP: dict[str, str] = {
+    "BED1": "P001", "BED2": "P002", "BED3": "P003",
+    "BED4": "P004", "BED5": "P005",
+}
+BED_PATIENT: dict[str, str] = {v: k for k, v in BED_MAP.items()}
+
 # Reverse maps
 PATIENT_WARD: dict[str, str] = {}
 for ward, pids in WARD_MAP.items():
@@ -335,6 +342,7 @@ def _patient_summary(patient_id: str) -> dict:
     latest = history[-1]
     return {
         "patient_id": patient_id,
+        "bed": BED_PATIENT.get(patient_id),
         "ward": PATIENT_WARD.get(patient_id),
         "doctor": PATIENT_DOCTOR.get(patient_id),
         "vitals": latest,
@@ -360,6 +368,43 @@ def get_doctor_patients(doctor_id: str):
     patients = [_patient_summary(pid) for pid in pids]
     patients.sort(key=lambda p: p["news_score"], reverse=True)
     return {"doctor_id": doctor_id, "patients": patients}
+
+
+# ---------------------------------------------------------------------------
+# Bed / Rounds endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/bed/{bed_id}/patient")
+def get_bed_patient(bed_id: str):
+    bed_key = bed_id.upper().replace(" ", "")
+    pid = BED_MAP.get(bed_key)
+    if pid is None:
+        raise HTTPException(status_code=404, detail=f"Bed {bed_id} not found")
+    return {"bed_id": bed_key, "patient_id": pid}
+
+
+@app.get("/ward/{ward_id}/rounds")
+def get_ward_rounds(ward_id: str):
+    pids = WARD_MAP.get(ward_id)
+    if pids is None:
+        raise HTTPException(status_code=404, detail=f"Ward {ward_id} not found")
+    now = datetime.now(timezone.utc)
+    cutoff_4h = now - timedelta(hours=4)
+    patients = []
+    for pid in pids:
+        summary = _patient_summary(pid)
+        history = VITALS_DB.get(pid, [])
+        vitals_4h = []
+        for r in history:
+            ts = datetime.fromisoformat(r["timestamp"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts >= cutoff_4h:
+                vitals_4h.append(r)
+        summary["vitals_4h"] = vitals_4h
+        patients.append(summary)
+    patients.sort(key=lambda p: p["news_score"], reverse=True)
+    return {"ward_id": ward_id, "patients": patients}
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +481,18 @@ def _read_event_ecg(patient_id: str, event_id: str) -> dict:
             }
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"HDF5 file not found for {patient_id}")
+
+
+@app.get("/ecg/{patient_id}/latest")
+def get_latest_ecg(patient_id: str):
+    """Return the most recent ECG for a patient (no event_id needed)."""
+    events = EVENT_INDEX.get(patient_id)
+    if not events:
+        raise HTTPException(status_code=404, detail=f"Patient {patient_id} not found")
+    # Sort by timestamp descending, take the first
+    sorted_events = sorted(events, key=lambda e: e["timestamp"], reverse=True)
+    latest = sorted_events[0]
+    return _read_event_ecg(patient_id, latest["event_id"])
 
 
 @app.get("/events/{patient_id}/{event_id}/vitals")

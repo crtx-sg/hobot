@@ -4,7 +4,7 @@ import json
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "nanobot"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "clinibot"))
 
 from formatter import (
     format_rich_response,
@@ -77,7 +77,7 @@ class TestTelegramRenderer:
         rendered = _render_telegram(blocks)
         assert rendered[0]["type"] == "inline_keyboard"
         cb = json.loads(rendered[0]["buttons"][0]["callback_data"])
-        assert cb["action"] == "get_vitals"
+        assert cb["a"] == "get_vitals"
 
     def test_confirmation(self):
         blocks = [{"type": "confirmation", "confirmation_id": "abc", "text": "Confirm?", "buttons": [{"label": "Confirm", "action": "confirm", "params": {"confirmation_id": "abc"}}]}]
@@ -91,15 +91,17 @@ class TestTelegramRenderer:
         assert rendered[0]["type"] == "image"
         assert rendered[0]["url"] == "http://example.com/xray.png"
 
-    def test_chart_passthrough(self):
+    def test_chart_rendered_as_image(self):
         blocks = [{"type": "chart", "title": "Trend", "chart_type": "line", "series": {}}]
         rendered = _render_telegram(blocks)
-        assert rendered[0]["type"] == "chart"
+        assert rendered[0]["type"] == "rendered_image"
+        assert rendered[0]["original_type"] == "chart"
 
-    def test_waveform_passthrough(self):
+    def test_waveform_rendered_as_image(self):
         blocks = [{"type": "waveform", "title": "ECG", "sampling_rate_hz": 200, "duration_s": 12, "leads": {}}]
         rendered = _render_telegram(blocks)
-        assert rendered[0]["type"] == "waveform"
+        assert rendered[0]["type"] == "rendered_image"
+        assert rendered[0]["original_type"] == "waveform"
 
 
 class TestWebchatRenderer:
@@ -110,11 +112,12 @@ class TestWebchatRenderer:
 
 
 class TestSlackRenderer:
-    def test_data_table_to_section(self):
+    def test_data_table_rendered_as_image(self):
+        """Slack renders data_table as image (per render_as_image config)."""
         blocks = [{"type": "data_table", "title": "Labs", "columns": ["Test", "Value"], "rows": [["WBC", "6.8"]]}]
         rendered = _render_slack(blocks)
-        assert rendered[0]["type"] == "section"
-        assert "*Labs*" in rendered[0]["text"]["text"]
+        assert rendered[0]["type"] == "rendered_image"
+        assert rendered[0]["original_type"] == "data_table"
 
     def test_actions_to_buttons(self):
         blocks = [{"type": "actions", "buttons": [{"label": "View", "action": "get_vitals", "params": {}}]}]
@@ -130,11 +133,12 @@ class TestSlackRenderer:
 
 
 class TestWhatsappRenderer:
-    def test_data_table_to_text(self):
+    def test_data_table_rendered_as_image(self):
+        """WhatsApp renders data_table as image (per render_as_image config)."""
         blocks = [{"type": "data_table", "title": "Vitals", "columns": ["Metric", "Value"], "rows": [["HR", "82"]]}]
         rendered = _render_whatsapp(blocks)
-        assert rendered[0]["type"] == "text"
-        assert "*Vitals*" in rendered[0]["content"]
+        assert rendered[0]["type"] == "rendered_image"
+        assert rendered[0]["original_type"] == "data_table"
 
     def test_actions_to_numbered_list(self):
         blocks = [{"type": "actions", "buttons": [{"label": "View"}, {"label": "History"}]}]

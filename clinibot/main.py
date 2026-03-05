@@ -1,9 +1,11 @@
 """Hobot Gateway — FastAPI app that orchestrates all MCP tool servers."""
 
+import asyncio
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI
@@ -19,13 +21,47 @@ import tools
 from agent import run_agent, run_agent_stream
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-logger = logging.getLogger("nanobot")
+logger = logging.getLogger("clinibot")
 
 AUDIT_DB = os.environ.get("AUDIT_DB", "/data/audit/clinic.db")
 SCHEMA_PATH = os.environ.get("SCHEMA_PATH", "/app/schema/init.sql")
 TOOLS_CONFIG = os.environ.get("TOOLS_CONFIG", "/app/config/tools.json")
 CHANNELS_CONFIG = os.environ.get("CHANNELS_CONFIG", "/app/config/channels.json")
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/config/config.json")
+
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+
+async def _reminder_loop():
+    """Background loop: check for due reminders every 30s and push via Telegram."""
+    while True:
+        await asyncio.sleep(30)
+        now = datetime.now(timezone.utc)
+        for rem_id, rem in list(tools._reminders.items()):
+            if rem["status"] != "pending":
+                continue
+            trigger_at = datetime.fromisoformat(rem["trigger_at"])
+            if trigger_at.tzinfo is None:
+                trigger_at = trigger_at.replace(tzinfo=timezone.utc)
+            if now >= trigger_at:
+                rem["status"] = "fired"
+                # Extract chat_id from session_id (format: tg-{chat_id})
+                session_id = rem.get("session_id", "")
+                if session_id.startswith("tg-") and TELEGRAM_BOT_TOKEN:
+                    chat_id = session_id[3:]
+                    text = f"\u23f0 Reminder: {rem['message']}"
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            await client.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                json={"chat_id": chat_id, "text": text},
+                            )
+                        logger.info("Fired reminder %s to chat %s", rem_id, chat_id)
+                    except Exception as exc:
+                        logger.error("Failed to send reminder %s: %s", rem_id, exc)
+                else:
+                    logger.info("Fired reminder %s (non-telegram, session=%s)", rem_id, session_id)
 
 
 @asynccontextmanager
@@ -36,11 +72,13 @@ async def lifespan(app: FastAPI):
     tools.load_tools_config(TOOLS_CONFIG)
     formatter.load_channels_config(CHANNELS_CONFIG)
     providers.load_providers(CONFIG_PATH)
-    logger.info("Nanobot gateway started")
+    reminder_task = asyncio.create_task(_reminder_loop())
+    logger.info("Clinibot gateway started")
     yield
     # Shutdown
+    reminder_task.cancel()
     await audit.close_db()
-    logger.info("Nanobot gateway stopped")
+    logger.info("Clinibot gateway stopped")
 
 
 app = FastAPI(title="Hobot Gateway", lifespan=lifespan)
@@ -101,7 +139,7 @@ async def health():
     all_ok = all(s == "ok" for s in statuses.values())
     return {
         "status": "ok" if all_ok else "degraded",
-        "service": "nanobot-gateway",
+        "service": "clinibot-gateway",
         "backends": statuses,
     }
 

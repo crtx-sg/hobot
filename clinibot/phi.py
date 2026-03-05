@@ -39,4 +39,8 @@ def restore(text: str, mapping: dict[str, str]) -> str:
     result = text
     for token, original in mapping.items():
         result = result.replace(token, original)
+        # Also match without brackets (LLMs may strip them in tool params)
+        bare = token.strip("[]")
+        if bare != token:
+            result = result.replace(bare, original)
     return result

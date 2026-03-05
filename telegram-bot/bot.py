@@ -1,8 +1,9 @@
-"""Telegram bot bridge — forwards messages to the nanobot gateway with rich rendering."""
+"""Telegram bot bridge — forwards messages to the clinibot gateway with rich rendering."""
 
 import json
 import logging
 import os
+import traceback
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -14,6 +15,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-bot")
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://nanobot-gateway:3000")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://clinibot-gateway:3000")
 TENANT_ID = os.environ.get("TENANT_ID", "default")
 
 TG_MAX_LENGTH = 4096
@@ -45,6 +47,13 @@ def split_message(text: str, limit: int = TG_MAX_LENGTH) -> list[str]:
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
     return chunks
+
+
+async def _verify_bot_identity(app) -> None:
+    """Log bot identity at startup so token mismatches are immediately visible."""
+    bot = app.bot
+    me = await bot.get_me()
+    logger.info("Bot identity: @%s (id=%s)", me.username, me.id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -183,8 +192,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("Invalid button data.")
         return
 
-    action = data.get("action", "")
-    params = data.get("params", {})
+    action = data.get("a", data.get("action", ""))
+    params = data.get("p", data.get("params", {}))
 
     chat_id = update.effective_chat.id
     user_id = str(update.effective_user.id)
@@ -271,13 +280,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await msg.reply_text(chunk, parse_mode="HTML")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and let polling continue instead of dying silently."""
+    logger.error("Update %s caused error: %s", update, context.error)
+    logger.debug(traceback.format_exc())
+
+
 def main() -> None:
     logger.info("Starting Telegram bot (gateway=%s, tenant=%s)", GATEWAY_URL, TENANT_ID)
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .connect_timeout(15.0)
+        .pool_timeout(30.0)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.run_polling()
+    app.add_error_handler(error_handler)
+    app.post_init = _verify_bot_identity
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"],
+    )
 
 
 if __name__ == "__main__":

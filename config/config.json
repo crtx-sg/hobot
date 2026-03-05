@@ -9,7 +9,7 @@
     },
     "ollama": {
       "baseUrl": "http://ollama:11434",
-      "model": "qwen2.5:7b",
+      "model": "glm-5:cloud",
       "phi_safe": true
     },
     "anthropic": {
@@ -21,8 +21,8 @@
   },
   "agents": {
     "defaults": {
-      "model": "gemini-2.0-flash",
-      "provider": "gemini"
+      "model": "claude-sonnet-4-20250514",
+      "provider": "anthropic"
     }
   }
 }

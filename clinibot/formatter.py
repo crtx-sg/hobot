@@ -164,9 +164,10 @@ def _tg_actions(block: dict) -> dict:
     buttons = block.get("buttons", [])
     keyboard = []
     for btn in buttons:
+        cb = json.dumps({"a": btn["action"], "p": btn.get("params", {})}, separators=(",", ":"))
         keyboard.append({
             "text": btn["label"],
-            "callback_data": json.dumps({"action": btn["action"], "params": btn.get("params", {})}),
+            "callback_data": cb,
         })
     return {"type": "inline_keyboard", "buttons": keyboard}
 
@@ -180,7 +181,7 @@ def _tg_confirmation(block: dict) -> dict:
         "html": f"\u26a0\ufe0f <b>Confirmation Required</b>\n{text}",
         "buttons": [{
             "text": "Confirm",
-            "callback_data": json.dumps({"action": "confirm", "params": {"confirmation_id": cid}}),
+            "callback_data": json.dumps({"a": "confirm", "p": {"confirmation_id": cid}}, separators=(",", ":")),
         }],
     }
 

@@ -2,7 +2,9 @@
 
 Conversational clinical agent that unifies eight hospital systems behind a single chat API. Clinicians ask questions in natural language; Hobot queries EHR, vitals, labs, imaging, pharmacy, blood bank, ERP, and patient services, then returns a synthesized answer.
 
-Built on a custom **nanobot gateway** (FastAPI) that orchestrates MCP tool servers, enforces clinical safety gates, extracts structured medical facts, and logs every action to an immutable audit trail.
+Built on a custom **clinibot gateway** (FastAPI) that orchestrates MCP tool servers, enforces clinical safety gates, extracts structured medical facts, and logs every action to an immutable audit trail.
+
+Supports **ward rounds reports** (severity-sorted with vitals, meds, scans), **bed-based queries** ("meds for patient in bed 5"), **appointment scheduling**, and **timed reminders** with Telegram push notifications.
 
 ---
 
@@ -66,15 +68,17 @@ First `docker compose up --build` takes a few minutes to build all images. Subse
                         │ (Gemini /    │
                         │ Ollama / Any)│
                         └──────▲───────┘
-                               │
+                               │ native tool_calls
+                               │ (OpenAI/Gemini)
+                               │ or text JSON (Ollama)
 ┌──────────────────────────────┼──────────────────────────────────┐
-│  Nanobot Gateway (:3000)     │                                  │
+│  Clinibot Gateway (:3000)     │                                  │
 │  ┌────────────┐  ┌───────────┴──────┐  ┌────────────────────┐  │
 │  │ /chat      │→ │  Agent Loop      │→ │  Tool Dispatch     │──┼──→ Synthetic Backends
-│  │ /chat/stream│ │  (multi-provider │  │  (HTTP to backends)│  │
-│  │ /health    │  │   + kw fallback) │  │  (param validation)│  │
-│  │ /confirm   │  └──────────────────┘  └────────────────────┘  │
-│  └────────────┘                                                 │
+│  │ /chat/stream│ │  (multi-provider │  │  (parallel via     │  │    (asyncio.gather)
+│  │ /health    │  │   native tools + │  │   asyncio.gather)  │  │
+│  │ /confirm   │  │   kw fallback)   │  │  (param validation)│  │
+│  └────────────┘  └──────────────────┘  └────────────────────┘  │
 │  ┌────────────┐  ┌──────────────────┐  ┌────────────────────┐  │
 │  │ Audit Log  │  │ Clinical Memory  │  │ PHI Redaction      │  │
 │  │ (SQLite)   │  │ (fact extraction │  │ (non-PHI-safe      │  │
@@ -92,7 +96,7 @@ First `docker compose up --build` takes a few minutes to build all images. Subse
 
 | Layer | Containers |
 |-------|-----------|
-| Gateway | `nanobot-gateway` |
+| Gateway | `clinibot-gateway` |
 | Model | `ollama` |
 | MCP tool servers (8) | `mcp-ehr`, `mcp-monitoring`, `mcp-radiology`, `mcp-lis`, `mcp-pharmacy`, `mcp-bloodbank`, `mcp-erp`, `mcp-patient-services` |
 | Synthetic backends (8) | `synthetic-ehr` (HAPI FHIR), `synthetic-monitoring`, `synthetic-radiology` (Orthanc), `synthetic-lis`, `synthetic-pharmacy`, `synthetic-bloodbank`, `synthetic-erp`, `synthetic-patient-services` |
@@ -105,7 +109,7 @@ First `docker compose up --build` takes a few minutes to build all images. Subse
 
 | Port | Service | Purpose |
 |------|---------|---------|
-| 3000 | nanobot-gateway | Chat API + health check |
+| 3000 | clinibot-gateway | Chat API + health check |
 | 8080 | synthetic-ehr (HAPI FHIR) | FHIR R4 server |
 | 8042 | synthetic-radiology (Orthanc) | DICOM/DICOMweb viewer |
 | 8081 | audit-db (sqlite-web) | Audit log browser |
@@ -199,7 +203,7 @@ Returns per-backend health status.
 ```json
 {
   "status": "ok",
-  "service": "nanobot-gateway",
+  "service": "clinibot-gateway",
   "backends": {
     "synthetic-monitoring": "ok",
     "synthetic-ehr": "ok",
@@ -258,11 +262,13 @@ Defines LLM providers and which one to use by default. The current default is **
 
 **Three provider types are supported:**
 
-| Provider type | Detection | Endpoint |
-|---------------|-----------|----------|
-| **GeminiProvider** | Name contains `gemini` or URL contains `generativelanguage.googleapis.com` | `{baseUrl}/chat/completions` |
-| **OllamaProvider** | Name contains `ollama` or URL contains `/api/` | `{baseUrl}/api/chat` |
-| **OpenAICompatibleProvider** | Everything else (OpenAI, Anthropic, vLLM, etc.) | `{baseUrl}/v1/chat/completions` |
+| Provider type | Detection | Endpoint | Native Tools |
+|---------------|-----------|----------|--------------|
+| **GeminiProvider** | Name contains `gemini` or URL contains `generativelanguage.googleapis.com` | `{baseUrl}/chat/completions` | Yes — parallel |
+| **OllamaProvider** | Name contains `ollama` or URL contains `/api/` | `{baseUrl}/api/chat` | No — text JSON fallback |
+| **OpenAICompatibleProvider** | Everything else (OpenAI, Anthropic, vLLM, etc.) | `{baseUrl}/v1/chat/completions` | Yes — parallel |
+
+Providers that support native function calling send tool definitions in the request and receive structured `tool_calls` in the response. The agent dispatches all tool calls in parallel via `asyncio.gather`. Ollama falls back to text-based JSON parsing (single tool per iteration).
 
 | Provider field | Description |
 |----------------|-------------|
@@ -380,6 +386,7 @@ The gateway reads these from docker-compose (all have defaults):
 | `ERP_BASE` | `http://synthetic-erp:8000` | ERP/inventory backend |
 | `PATIENT_SERVICES_BASE` | `http://synthetic-patient-services:8000` | Patient services backend |
 | `ANTHROPIC_API_KEY` | (none) | Required if using Anthropic provider |
+| `TELEGRAM_BOT_TOKEN` | (none) | Required for reminder push notifications to Telegram |
 
 To point at real hospital systems, change the `*_BASE` variables to their production URLs.
 
@@ -399,7 +406,7 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 | **Blood Bank** | `get_blood_availability`, `order_blood_crossmatch`, `get_crossmatch_status` | synthetic-bloodbank |
 | **ERP** | `get_inventory`, `get_equipment_status`, `place_supply_order` | synthetic-erp |
 | **Patient Services** | `request_housekeeping`, `order_diet`, `request_ambulance`, `get_request_status` | synthetic-patient-services |
-| **Gateway** | `escalate` | nanobot (internal) |
+| **Gateway** | `escalate`, `get_ward_rounds`, `resolve_bed`, `schedule_appointment`, `set_reminder` | clinibot (internal) |
 
 ---
 
@@ -407,11 +414,13 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 
 ### Multi-Provider LLM Routing
 
-The gateway supports multiple LLM backends through a provider abstraction layer (`providers.py`). Three provider types are built in:
+The gateway supports multiple LLM backends through a provider abstraction layer (`providers.py`). All providers return a unified `ChatResult` (content + optional `ToolCall` list). Three provider types are built in:
 
-- **GeminiProvider** — Google Gemini via its OpenAI-compatible endpoint (`{baseUrl}/chat/completions`)
-- **OllamaProvider** — local GPU inference via Ollama `/api/chat`
-- **OpenAICompatibleProvider** — any `/v1/chat/completions` API (OpenAI, Anthropic, vLLM, etc.)
+- **GeminiProvider** — Google Gemini via its OpenAI-compatible endpoint (`{baseUrl}/chat/completions`). Supports native function calling.
+- **OllamaProvider** — local GPU inference via Ollama `/api/chat`. Text-based tool parsing (single tool per iteration).
+- **OpenAICompatibleProvider** — any `/v1/chat/completions` API (OpenAI, Anthropic, vLLM, etc.). Supports native function calling.
+
+Providers with native function calling receive structured tool definitions and can return multiple `tool_calls` in a single response. These are dispatched in parallel via `asyncio.gather`, significantly reducing latency for multi-tool queries.
 
 The default provider is **Gemini** (`gemini-2.0-flash`). Provider selection is configured in `config.json`. At runtime, the gateway checks provider health; if the default provider is down, the agent falls back to keyword-based intent detection.
 
@@ -458,6 +467,11 @@ When no LLM provider is available, the agent uses regex-based intent detection t
 - "list wards" → `list_wards()`
 - "lab results P001" → `get_lab_results(patient_id="P001")`
 - "blood availability" → `get_blood_availability()`
+- "rounds report for ICU-A" → `get_ward_rounds(ward_id="ICU-A")`
+- "meds for bed 5" → `resolve_bed` → `get_medications(patient_id="P005")`
+- "vitals for patient in bed 3" → `resolve_bed` → `get_vitals(patient_id="P003")`
+- "schedule appointment with Dr Patel for patient in bed 5" → `schedule_appointment(...)`
+- "remind me in 2 hours to turn patient in bed 3" → `set_reminder(delay_minutes=120, ...)`
 
 ### Vitals Trend Analysis with EWS Scoring
 
@@ -490,6 +504,142 @@ The `get_vitals_trend` tool provides per-reading Early Warning Score (EWS) compu
 - P003: deteriorating (HR 70→110, SpO2 98→92, temp 37→39)
 - P005: improving (HR 105→75, SpO2 93→98)
 - P001, P002, P004: random (stable)
+
+### Ward Rounds Report
+
+The `get_ward_rounds` tool produces a severity-sorted patient report for an entire ward. It performs multi-service fan-out: fetches vitals from monitoring, medications from EHR, and latest imaging from radiology — all merged into a single response per patient.
+
+**Query:** `"rounds report for ICU-A"`
+
+**What it returns per patient (sorted by NEWS score descending):**
+- Patient ID, bed assignment, attending doctor
+- NEWS score with latest vitals (HR, BP, SpO2, Temp)
+- 4-hour vitals history window
+- Active medications (first 3)
+- Latest radiology scan description
+- Alert block if NEWS >= 5
+
+**Rich blocks generated:**
+
+| Block | Content |
+|-------|---------|
+| `key_value` | One per patient: Bed, NEWS, HR, BP, SpO2, Temp, Doctor, Meds, Last Scan |
+| `alert` | Per patient with NEWS >= 5 — "needs urgent review" |
+
+**Bed assignments (static seed data):**
+
+| Bed | Patient |
+|-----|---------|
+| BED1 | P001 |
+| BED2 | P002 |
+| BED3 | P003 |
+| BED4 | P004 |
+| BED5 | P005 |
+
+### Bed-Based Queries
+
+Clinicians can query by bed number instead of patient ID. The agent auto-resolves `bed_id` → `patient_id` before dispatching the actual tool.
+
+**Examples:**
+- "meds for patient in bed 5" → resolves BED5 → P005 → calls `get_medications`
+- "show vitals for bed 3" → resolves BED3 → P003 → calls `get_vitals`
+
+Resolution uses the `resolve_bed` gateway tool, which queries the monitoring service's `/bed/{bed_id}/patient` endpoint. In keyword mode, bed resolution is automatic and transparent. In LLM mode, the system prompt instructs the model to call `resolve_bed` first.
+
+### Appointment Scheduling
+
+The `schedule_appointment` tool creates in-memory appointments. Designed for quick scheduling from the chat interface.
+
+**Query:** `"schedule appointment with Dr Patel for patient in bed 5"`
+
+**Parameters:**
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `patient_id` | string | yes | Resolved from bed if needed |
+| `doctor` | string | yes | Doctor name/ID |
+| `datetime` | string | yes | Appointment time |
+| `notes` | string | no | Additional notes |
+
+**Returns:** `{appointment_id, patient_id, doctor, datetime, status:"scheduled"}`
+
+Appointments are stored in-memory on the gateway. They survive within a gateway process lifetime but are cleared on restart.
+
+### Timed Reminders
+
+The `set_reminder` tool schedules a reminder that fires after a specified delay. For Telegram users, the reminder is pushed directly to their chat via the Telegram Bot API.
+
+**Query:** `"remind me in 2 hours to turn patient in bed 3"`
+
+**How it works:**
+1. Gateway stores the reminder in-memory with a trigger timestamp
+2. A background loop checks every 30 seconds for due reminders
+3. When triggered, extracts `chat_id` from the session ID (`tg-{chat_id}`)
+4. Sends a push message via `https://api.telegram.org/bot{token}/sendMessage`
+5. Marks reminder as `"fired"`
+
+**Parameters:**
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message` | string | yes | Reminder text |
+| `delay_minutes` | number | yes | Minutes until reminder fires |
+
+Requires `TELEGRAM_BOT_TOKEN` to be set on the clinibot-gateway service for push delivery.
+
+### Agent Orchestration
+
+The gateway uses two execution paths — **LLM-driven** and **keyword fallback** — with shared tool dispatch and post-processing.
+
+#### Multi-Step Tool Chaining (LLM Path)
+
+When an LLM provider is available, the agent runs an iterative loop (up to 10 iterations):
+
+1. Send conversation + system prompt + tool definitions to LLM
+2. LLM returns either tool call(s) or a final text response
+3. If tool calls: dispatch **all in parallel** via `asyncio.gather`, append results to context, loop back to step 1
+4. If text: return to user
+
+**Native tool calling** (OpenAI/Gemini): Tool definitions are sent as structured `tools` in the API request. The LLM returns typed `tool_calls` with IDs. Multiple tools in a single response are dispatched concurrently. Results are fed back as `role="tool"` messages keyed by `tool_call_id`.
+
+**Text fallback** (Ollama): Tools are described in the system prompt. The LLM emits a JSON block `{"tool":"...", "params":{...}}`. One tool per iteration. Results are fed back as `role="user"` messages.
+
+This allows multi-step reasoning. For example, with native tools, "compare vitals and meds for P003" triggers:
+- LLM returns 2 tool_calls: `get_vitals(P003)` + `get_medications(P003)` → dispatched in parallel
+- LLM synthesizes comparison from both results in one pass
+
+With text fallback, the same query takes 2 sequential iterations.
+
+#### Multi-Service Fan-Out (Gateway Tools)
+
+Some gateway tools orchestrate multiple backend calls internally:
+
+- **`get_ward_rounds`**: Calls monitoring `/ward/{id}/rounds`, then fans out per patient to EHR (medications) and Orthanc (latest scan) **in parallel** (`asyncio.gather` for both requests per patient AND across all patients). Returns merged data.
+
+This keeps the LLM loop simple (single tool call) while the gateway handles the cross-service aggregation.
+
+#### Bed Auto-Resolution (Keyword Path)
+
+In keyword fallback mode, bed references are resolved transparently:
+
+```
+User: "meds for bed 5"
+  ↓ regex match → tool=get_medications, bed_id=BED5
+  ↓ auto-resolve: call resolve_bed(BED5) → patient_id=P005
+  ↓ dispatch: get_medications(patient_id=P005)
+  ↓ return result
+```
+
+The `bed_id` is consumed during resolution and replaced with `patient_id` before the target tool is called.
+
+#### Context and Memory
+
+Each execution path shares:
+- **Clinical memory**: facts extracted from tool results, injected into LLM context
+- **Session persistence**: JSONL on disk, survives restarts
+- **Consolidation**: LLM summarizes old messages when threshold exceeded
+- **PHI redaction**: automatic for non-PHI-safe providers
+- **Audit logging**: every tool call and response logged with timing
 
 ---
 
@@ -562,11 +712,11 @@ hobot/
 │   └── channels.json        # Channel formatting capabilities
 ├── schema/
 │   └── init.sql             # Audit DB schema (SQLite)
-├── nanobot/                  # Gateway (FastAPI, port 3000)
-│   ├── main.py              # App + endpoints (/chat, /chat/stream, /health, /confirm)
-│   ├── agent.py             # Agent loop (multi-provider + consolidation + streaming)
-│   ├── providers.py         # LLM provider abstraction (Gemini, Ollama, OpenAI-compatible)
-│   ├── tools.py             # Tool registry + param validation + HTTP dispatch + critical gate
+├── clinibot/                 # Gateway (FastAPI, port 3000)
+│   ├── main.py              # App + endpoints (/chat, /chat/stream, /health, /confirm) + reminder background loop
+│   ├── agent.py             # Agent loop (native + text tool paths, parallel dispatch, consolidation, streaming)
+│   ├── providers.py         # LLM provider abstraction (Gemini, Ollama, OpenAI-compatible) + ChatResult/ToolCall
+│   ├── tools.py             # Tool registry + parallel dispatch + tool definitions + param validation + HTTP dispatch + critical gate + gateway tools
 │   ├── audit.py             # SQLite audit logging
 │   ├── clinical_memory.py   # Fact extraction + storage
 │   ├── session.py           # JSONL-backed session persistence
@@ -623,7 +773,7 @@ To use Ollama (local GPU) instead of Gemini, see [Change the Default LLM Model](
 docker compose up -d
 
 # Start just the gateway (if backends already running)
-docker compose up -d nanobot-gateway
+docker compose up -d clinibot-gateway
 ```
 
 ### Stop
@@ -639,7 +789,7 @@ docker compose down -v
 ### Restart Gateway Only
 
 ```bash
-docker compose restart nanobot-gateway
+docker compose restart clinibot-gateway
 ```
 
 Sessions persist across restarts (JSONL on disk). Reuse the same `session_id` to continue a conversation.
@@ -648,7 +798,7 @@ Sessions persist across restarts (JSONL on disk). Reuse the same `session_id` to
 
 ```bash
 # Rebuild + restart gateway only
-docker compose build nanobot-gateway && docker compose up -d nanobot-gateway
+docker compose build clinibot-gateway && docker compose up -d clinibot-gateway
 
 # Rebuild a specific service
 docker compose build mcp-bloodbank && docker compose up -d mcp-bloodbank
@@ -672,7 +822,7 @@ Edit `agents.defaults` in `config/config.json`:
 }
 ```
 
-Then restart: `docker compose restart nanobot-gateway`
+Then restart: `docker compose restart clinibot-gateway`
 
 **Switch to Ollama (local GPU):**
 
@@ -702,7 +852,7 @@ curl -s -X POST http://localhost:3000/chat \
   | jq .session_id
 
 # Restart the gateway
-docker compose restart nanobot-gateway
+docker compose restart clinibot-gateway
 
 # Continue the same session
 curl -X POST http://localhost:3000/chat \
@@ -710,7 +860,7 @@ curl -X POST http://localhost:3000/chat \
   -d '{"message":"What did I ask?","user_id":"doc1","channel":"webchat","tenant_id":"T1","session_id":"<id>"}'
 
 # Inspect session files on disk
-docker compose exec nanobot-gateway ls /data/sessions/T1/
+docker compose exec clinibot-gateway ls /data/sessions/T1/
 ```
 
 ---
@@ -721,10 +871,10 @@ docker compose exec nanobot-gateway ls /data/sessions/T1/
 
 ```bash
 # Gateway logs (follow)
-docker compose logs -f nanobot-gateway
+docker compose logs -f clinibot-gateway
 
 # Gateway + all backends (trace requests end-to-end)
-docker compose logs -f nanobot-gateway synthetic-monitoring synthetic-ehr \
+docker compose logs -f clinibot-gateway synthetic-monitoring synthetic-ehr \
   synthetic-lis synthetic-pharmacy synthetic-radiology synthetic-bloodbank \
   synthetic-erp synthetic-patient-services
 
@@ -735,7 +885,7 @@ docker compose logs -f
 docker compose logs -f synthetic-monitoring
 
 # Last 50 lines (no follow)
-docker compose logs --tail 50 nanobot-gateway
+docker compose logs --tail 50 clinibot-gateway
 ```
 
 ### Tracing a Request
@@ -745,7 +895,7 @@ To follow a single query through the system, tail the logs in one terminal and f
 **Terminal 1:**
 
 ```bash
-docker compose logs -f nanobot-gateway
+docker compose logs -f clinibot-gateway
 ```
 
 **Terminal 2:**
@@ -760,12 +910,12 @@ curl -s -X POST http://localhost:3000/chat \
 
 | Step | Logger | What you see |
 |------|--------|--------------|
-| 1. Request received | `nanobot` | FastAPI access log: `POST /chat` |
-| 2. Provider health check | `nanobot.providers` | `GET {provider}/models` (skipped if cached within 30s TTL) |
+| 1. Request received | `clinibot` | FastAPI access log: `POST /chat` |
+| 2. Provider health check | `clinibot.providers` | `GET {provider}/models` (skipped if cached within 30s TTL) |
 | 3. LLM inference | `httpx` | `POST {provider}/chat/completions "HTTP/1.1 200 OK"` |
 | 4. Tool dispatch | `httpx` | `HTTP Request: GET http://synthetic-monitoring:8000/vitals/P001` |
 | 5. LLM synthesis | `httpx` | Second `POST .../chat/completions` (LLM summarizes tool result) |
-| 6. Response returned | `nanobot` | FastAPI response log |
+| 6. Response returned | `clinibot` | FastAPI response log |
 
 If the LLM provider is down, steps 2-5 are replaced by keyword fallback (no LLM calls, just the backend tool call).
 
@@ -837,16 +987,16 @@ docker compose exec audit-db sqlite3 /data/clinic.db \
 
 ```bash
 # List sessions for a tenant
-docker compose exec nanobot-gateway ls /data/sessions/T1/
+docker compose exec clinibot-gateway ls /data/sessions/T1/
 
 # Read a session JSONL (line 0 = metadata, lines 1+ = messages)
-docker compose exec nanobot-gateway cat /data/sessions/T1/<session_id>.jsonl
+docker compose exec clinibot-gateway cat /data/sessions/T1/<session_id>.jsonl
 
 # Count messages in a session
-docker compose exec nanobot-gateway wc -l /data/sessions/T1/<session_id>.jsonl
+docker compose exec clinibot-gateway wc -l /data/sessions/T1/<session_id>.jsonl
 
 # Check consolidation state (summary field in metadata line)
-docker compose exec nanobot-gateway head -1 /data/sessions/T1/<session_id>.jsonl | python3 -m json.tool
+docker compose exec clinibot-gateway head -1 /data/sessions/T1/<session_id>.jsonl | python3 -m json.tool
 ```
 
 ### Common Issues
@@ -855,7 +1005,7 @@ docker compose exec nanobot-gateway head -1 /data/sessions/T1/<session_id>.jsonl
 |---------|-------|-----|
 | `"status":"degraded"` in `/health` | One or more backends down | Check `docker compose ps`, restart failed service |
 | All responses are keyword-formatted JSON | LLM provider unreachable | Check provider logs; for Gemini verify `GEMINI_API_KEY` is set; for Ollama check model is pulled |
-| `OpenAI-compatible chat failed` in logs | Cloud provider error (rate limit, auth, timeout) | Check API key, quota, and `docker compose logs nanobot-gateway` |
+| `OpenAI-compatible chat failed` in logs | Cloud provider error (rate limit, auth, timeout) | Check API key, quota, and `docker compose logs clinibot-gateway` |
 | `Ollama chat failed` in logs | Model not loaded or OOM | `docker compose exec ollama ollama list`, check GPU memory |
 | `Invalid parameters:` error returned | Tool params failed validation | Check params against schema in `config/tools.json` |
 | Session not found after restart | Wrong `tenant_id` on follow-up request | `tenant_id` is part of the session path; must match |
@@ -893,7 +1043,7 @@ Button presses are handled via `CallbackQueryHandler`: action buttons send a syn
 | Variable | Required | Default |
 |----------|----------|---------|
 | `TELEGRAM_BOT_TOKEN` | yes | — |
-| `GATEWAY_URL` | no | `http://nanobot-gateway:3000` |
+| `GATEWAY_URL` | no | `http://clinibot-gateway:3000` |
 | `TENANT_ID` | no | `default` |
 
 ### Telegram Bot Examples
@@ -958,6 +1108,79 @@ Tapping **Confirm** POSTs to `/confirm/{id}` and the bot replies with the execut
 
 **Action buttons** — any `actions` block renders as inline keyboard buttons. Each button triggers a new query to the gateway when tapped, keeping the full conversation in the audit trail.
 
+**Ward rounds report** — per-patient cards sorted by severity:
+
+```
+User: rounds report for ICU-A
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ <b>P003 — Ward ICU-A</b>        │
+│ Bed: BED3                       │
+│ NEWS: 7                         │
+│ HR: 115  BP: 90/55  SpO2: 91    │
+│ Temp: 38.5                      │
+│ Doctor: DR-SMITH                 │
+│ Meds: Vancomycin, Norepinephrine│
+│ Last Scan: Chest CT             │
+│                                  │
+│ ⚠️ P003 NEWS=7 — urgent review  │
+├──────────────────────────────────┤
+│ <b>P001 — Ward ICU-A</b>        │
+│ Bed: BED1                       │
+│ NEWS: 2                         │
+│ HR: 80  BP: 120/78  SpO2: 97    │
+│ ...                              │
+└──────────────────────────────────┘
+```
+
+**Bed-based query** — resolves bed to patient transparently:
+
+```
+User: meds for bed 5
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ <b>Medications — P005</b>        │
+│ Metoprolol  50mg  PO  BID       │
+│ Aspirin     81mg  PO  Daily     │
+│ ...                              │
+└──────────────────────────────────┘
+```
+
+**Scheduling** — appointment confirmation card:
+
+```
+User: schedule appointment with Dr Patel for patient in bed 5
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ <b>Appointment Scheduled</b>     │
+│ ID: APPT-3F8A2C1B               │
+│ Patient: P005                    │
+│ Doctor: DR-PATEL                 │
+│ When: TBD                       │
+│ Status: scheduled               │
+└──────────────────────────────────┘
+```
+
+**Reminder** — scheduled confirmation + push at trigger time:
+
+```
+User: remind me in 2 hours to turn patient in bed 3
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ <b>Reminder Set</b>              │
+│ ID: REM-7E4B1A2D                 │
+│ Message: remind me in 2 hours...│
+│ Fires at: 2026-03-04T18:00:00   │
+└──────────────────────────────────┘
+
+... 2 hours later, bot pushes:
+⏰ Reminder: remind me in 2 hours to turn patient in bed 3
+```
+
 ---
 
 ## Swapping Synthetic Backends for Real Systems
@@ -966,7 +1189,7 @@ Each backend URL is configured via environment variable. To connect to a real ho
 
 ```yaml
 # docker-compose.yml
-nanobot-gateway:
+clinibot-gateway:
   environment:
     - EHR_BASE=https://real-ehr.hospital.local/fhir
 ```
@@ -980,8 +1203,8 @@ Remove the corresponding `synthetic-*` service and its `mcp-*` dependency. The g
 | Volume | Mounted On | Purpose |
 |--------|-----------|---------|
 | `ollama-models` | ollama `/root/.ollama` | Persists downloaded LLM models |
-| `audit-data` | nanobot-gateway `/data/audit`, audit-db `/data` | SQLite audit + clinical facts DB |
-| `sessions-data` | nanobot-gateway `/data/sessions` | JSONL session files (per-tenant) |
+| `audit-data` | clinibot-gateway `/data/audit`, audit-db `/data` | SQLite audit + clinical facts DB |
+| `sessions-data` | clinibot-gateway `/data/sessions` | JSONL session files (per-tenant) |
 | `hdf5-data` | synthetic-monitoring `/data/hdf5` | Persists HDF5 vitals data across restarts |
 
 ---

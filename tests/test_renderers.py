@@ -1,9 +1,9 @@
-"""Unit tests for nanobot/renderers.py — server-side image rendering."""
+"""Unit tests for clinibot/renderers.py — server-side image rendering."""
 
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "nanobot"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "clinibot"))
 
 from renderers import render_chart, render_waveform, render_table
 

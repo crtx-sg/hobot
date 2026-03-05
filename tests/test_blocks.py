@@ -1,11 +1,11 @@
-"""Unit tests for nanobot/blocks.py — pure functions, no stack needed."""
+"""Unit tests for clinibot/blocks.py — pure functions, no stack needed."""
 
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "nanobot"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "clinibot"))
 
-from blocks import build_blocks, _build_vitals_blocks, _build_lab_blocks, _build_medications_blocks, _build_allergies_blocks, _build_patient_blocks, _build_blood_availability_blocks, _build_ward_patients_blocks, _build_drug_interactions_blocks, _build_confirmation_blocks, _build_vitals_history_blocks, _build_studies_blocks, _build_ecg_blocks, _build_report_blocks, _build_vitals_trend_blocks
+from blocks import build_blocks, _build_vitals_blocks, _build_lab_blocks, _build_medications_blocks, _build_allergies_blocks, _build_patient_blocks, _build_blood_availability_blocks, _build_ward_patients_blocks, _build_drug_interactions_blocks, _build_confirmation_blocks, _build_vitals_history_blocks, _build_studies_blocks, _build_ecg_blocks, _build_report_blocks, _build_vitals_trend_blocks, _build_ward_rounds_blocks, _build_resolve_bed_blocks, _build_schedule_blocks, _build_reminder_blocks
 
 
 class TestBuildVitalsBlocks:
@@ -409,14 +409,43 @@ class TestBuildVitalsTrendBlocks:
             },
         }
 
-    def test_stable_trend_no_alert(self):
+    def test_chart_mode_default_has_chart_no_table(self):
+        """Default display (chart) emits chart with all vitals, no data_table."""
         data = self._make_trend_data("stable", "low")
         blocks = _build_vitals_trend_blocks(data, {})
         types = [b["type"] for b in blocks]
-        assert "data_table" in types
         assert "chart" in types
+        assert "data_table" not in types
         assert "text" in types
         assert "alert" not in types
+
+    def test_chart_mode_explicit_has_chart_no_table(self):
+        data = self._make_trend_data("stable", "low")
+        blocks = _build_vitals_trend_blocks(data, {"display": "chart"})
+        types = [b["type"] for b in blocks]
+        assert "chart" in types
+        assert "data_table" not in types
+
+    def test_chart_has_all_vitals_series(self):
+        data = self._make_trend_data("stable", "low")
+        blocks = _build_vitals_trend_blocks(data, {"display": "chart"})
+        chart = [b for b in blocks if b["type"] == "chart"][0]
+        for key in ("heart_rate", "bp_systolic", "spo2", "temperature"):
+            assert key in chart["series"], f"Missing series: {key}"
+
+    def test_raw_mode_has_table_no_chart(self):
+        data = self._make_trend_data("stable", "low")
+        blocks = _build_vitals_trend_blocks(data, {"display": "raw"})
+        types = [b["type"] for b in blocks]
+        assert "data_table" in types
+        assert "chart" not in types
+        assert "text" in types
+
+    def test_raw_mode_ews_column_in_table(self):
+        data = self._make_trend_data("stable", "low")
+        blocks = _build_vitals_trend_blocks(data, {"display": "raw"})
+        table = [b for b in blocks if b["type"] == "data_table"][0]
+        assert "EWS" in table["columns"]
 
     def test_deteriorating_high_confidence_critical_alert(self):
         data = self._make_trend_data("deteriorating", "high")
@@ -439,14 +468,113 @@ class TestBuildVitalsTrendBlocks:
         assert blocks[0]["type"] == "text"
         assert "Error" in blocks[0]["content"]
 
-    def test_ews_column_in_table(self):
-        data = self._make_trend_data("stable", "low")
-        blocks = _build_vitals_trend_blocks(data, {})
-        table = [b for b in blocks if b["type"] == "data_table"][0]
-        assert "EWS" in table["columns"]
-
     def test_single_reading_no_chart(self):
         data = self._make_trend_data("stable", "low", n_readings=1)
         blocks = _build_vitals_trend_blocks(data, {})
         charts = [b for b in blocks if b["type"] == "chart"]
         assert len(charts) == 0
+
+
+class TestBuildWardRoundsBlocks:
+    def test_basic_rounds(self):
+        data = {
+            "ward_id": "ICU-A",
+            "patients": [
+                {
+                    "patient_id": "P001",
+                    "bed": "BED1",
+                    "doctor": "DR-SMITH",
+                    "news_score": 3,
+                    "vitals": {"heart_rate": 80, "bp_systolic": 120, "bp_diastolic": 78, "spo2": 97, "temperature": 37.1},
+                    "medications": [{"medication": "Metformin"}],
+                    "latest_scan": {"description": "Chest CT"},
+                },
+            ],
+        }
+        blocks = _build_ward_rounds_blocks(data, {})
+        kv = blocks[0]
+        assert kv["type"] == "key_value"
+        assert "P001" in kv["title"]
+        keys = [item["key"] for item in kv["items"]]
+        assert "Bed" in keys
+        assert "NEWS" in keys
+        assert "Meds" in keys
+
+    def test_high_news_alert(self):
+        data = {
+            "ward_id": "ICU-A",
+            "patients": [
+                {
+                    "patient_id": "P003",
+                    "bed": "BED3",
+                    "doctor": "DR-SMITH",
+                    "news_score": 7,
+                    "vitals": {"heart_rate": 115, "bp_systolic": 90, "bp_diastolic": 55, "spo2": 91, "temperature": 38.5},
+                    "medications": [],
+                    "latest_scan": None,
+                },
+            ],
+        }
+        blocks = _build_ward_rounds_blocks(data, {})
+        alerts = [b for b in blocks if b["type"] == "alert"]
+        assert len(alerts) == 1
+        assert "P003" in alerts[0]["text"]
+
+    def test_error_returns_empty(self):
+        assert _build_ward_rounds_blocks({"error": "not found"}, {}) == []
+
+
+class TestBuildResolveBedBlocks:
+    def test_basic(self):
+        data = {"bed_id": "BED3", "patient_id": "P003"}
+        blocks = _build_resolve_bed_blocks(data, {})
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "text"
+        assert "BED3" in blocks[0]["content"]
+        assert "P003" in blocks[0]["content"]
+
+    def test_error(self):
+        assert _build_resolve_bed_blocks({"error": "not found"}, {}) == []
+
+
+class TestBuildScheduleBlocks:
+    def test_basic(self):
+        data = {
+            "appointment_id": "APPT-12345678",
+            "patient_id": "P005",
+            "doctor": "DR-PATEL",
+            "datetime": "2026-03-05T10:00:00",
+            "status": "scheduled",
+        }
+        blocks = _build_schedule_blocks(data, {})
+        assert len(blocks) == 1
+        kv = blocks[0]
+        assert kv["type"] == "key_value"
+        assert kv["title"] == "Appointment Scheduled"
+        keys = [item["key"] for item in kv["items"]]
+        assert "Doctor" in keys
+        assert "When" in keys
+
+    def test_error(self):
+        assert _build_schedule_blocks({"error": "failed"}, {}) == []
+
+
+class TestBuildReminderBlocks:
+    def test_basic(self):
+        data = {
+            "reminder_id": "REM-ABCD1234",
+            "message": "Turn patient in bed 3",
+            "trigger_at": "2026-03-04T16:00:00+00:00",
+            "status": "scheduled",
+        }
+        blocks = _build_reminder_blocks(data, {})
+        assert len(blocks) == 1
+        kv = blocks[0]
+        assert kv["type"] == "key_value"
+        assert kv["title"] == "Reminder Set"
+        keys = [item["key"] for item in kv["items"]]
+        assert "Message" in keys
+        assert "Fires at" in keys
+
+    def test_error(self):
+        assert _build_reminder_blocks({"error": "failed"}, {}) == []
