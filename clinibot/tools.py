@@ -183,7 +183,10 @@ async def _get_ward_rounds(params: dict, session: Any) -> dict:
 
 async def _resolve_bed(params: dict, session: Any) -> dict:
     """Resolve bed ID to patient ID via monitoring service."""
-    bed_id = params.get("bed_id", "")
+    bed_id = params.get("bed_id", "").strip().upper()
+    # Normalize: "2" → "BED2", "bed2" → "BED2"
+    if bed_id and not bed_id.startswith("BED"):
+        bed_id = f"BED{bed_id}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(f"{MONITORING_BASE}/bed/{bed_id}/patient")
         if resp.status_code != 200:
@@ -263,7 +266,7 @@ def get_tool_list() -> list[dict]:
 
 _TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_ward_rounds": "Get ward rounds report with vitals, meds, scans per patient",
-    "resolve_bed": "Resolve bed number to patient_id",
+    "resolve_bed": "Resolve bed number to patient_id (bed_id: just the number e.g. '2' or 'BED2')",
     "schedule_appointment": "Schedule appointment for a patient with a doctor",
     "set_reminder": "Set a timed reminder (fires via Telegram push)",
     "get_vitals": "Get latest vitals for a patient",
@@ -466,12 +469,14 @@ async def _dispatch(tool_name: str, params: dict, session: Any) -> dict:
     base, method, path_template = TOOL_BACKENDS[tool_name]
     url, remaining = _build_url(base, path_template, params)
     logger.info("[%s] dispatch %s %s", session.id, method, url)
+    # Orthanc (radiology) requires basic auth
+    auth = ("orthanc", "orthanc") if base == RADIOLOGY_BASE else None
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             if method == "GET":
-                resp = await client.get(url, params=remaining if remaining else None)
+                resp = await client.get(url, params=remaining if remaining else None, auth=auth)
             else:
-                resp = await client.post(url, json=remaining if remaining else params)
+                resp = await client.post(url, json=remaining if remaining else params, auth=auth)
             resp.raise_for_status()
             logger.info("[%s] dispatch %s -> %d", session.id, tool_name, resp.status_code)
             return resp.json()

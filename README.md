@@ -238,7 +238,7 @@ Defines LLM providers and which one to use by default. The current default is **
     "gemini": {
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
       "apiKey": "${GEMINI_API_KEY}",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "phi_safe": false,
       "timeout": 30.0
     },

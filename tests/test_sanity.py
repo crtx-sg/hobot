@@ -255,8 +255,11 @@ def test_chat_code_blue_telegram_has_confirm_button(client):
         conf_blocks = [b for b in blocks if b.get("type") == "confirmation"]
         assert len(conf_blocks) > 0
         cb_data = json.loads(conf_blocks[0]["buttons"][0]["callback_data"])
-        assert cb_data["action"] == "confirm"
-        assert "confirmation_id" in cb_data["params"]
+        # Formatter uses short keys ("a"/"p") for Telegram's 64-byte callback_data limit
+        action = cb_data.get("a", cb_data.get("action", ""))
+        params = cb_data.get("p", cb_data.get("params", {}))
+        assert action == "confirm"
+        assert "confirmation_id" in params
 
 
 def test_chat_slack_blocks_are_block_kit(client):
@@ -274,7 +277,9 @@ def test_chat_slack_blocks_are_block_kit(client):
     body = r.json()
     blocks = body.get("blocks")
     if blocks is not None:
-        assert any(b.get("type") == "section" for b in blocks)
+        # Slack data_table may render as "section" (mrkdwn) or "rendered_image"
+        # (when render_as_image includes data_table in channels.json)
+        assert any(b.get("type") in ("section", "rendered_image") for b in blocks)
 
 
 def test_chat_whatsapp_filters_unsupported_blocks(client):

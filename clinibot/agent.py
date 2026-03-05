@@ -500,6 +500,22 @@ async def _run_with_provider(user_message: str, session: Session, provider) -> A
                 )
             collected_tool_results.extend(tool_results)
 
+            # If any tool returned awaiting_confirmation, return immediately
+            # so the confirmation block reaches the client (don't feed to LLM).
+            confirmation_results = [
+                tr for tr in tool_results
+                if tr["data"].get("status") == "awaiting_confirmation"
+            ]
+            if confirmation_results:
+                cr = confirmation_results[0]
+                text = (
+                    f"This is a critical action ({cr['tool']}) that requires confirmation.\n"
+                    f"Confirmation ID: {cr['data']['confirmation_id']}\n"
+                    f"{cr['data']['message']}"
+                )
+                logger.info("[%s] critical tool %s gated — returning confirmation", session.id, cr["tool"])
+                return AgentResult(text=text, tool_results=collected_tool_results)
+
             # Append assistant message with tool_calls, then tool results
             messages.append(result.raw_message)
             for tc, tr in zip(result.tool_calls, tool_results):
@@ -551,6 +567,16 @@ async def _run_with_provider(user_message: str, session: Session, provider) -> A
             await _post_tool_hooks(tool_name, tool_result, params, session, provider.config.name)
 
             collected_tool_results.append({"tool": tool_name, "params": params, "data": tool_result})
+
+            # Critical tool confirmation — return immediately, don't feed to LLM
+            if tool_result.get("status") == "awaiting_confirmation":
+                text = (
+                    f"This is a critical action ({tool_name}) that requires confirmation.\n"
+                    f"Confirmation ID: {tool_result['confirmation_id']}\n"
+                    f"{tool_result['message']}"
+                )
+                logger.info("[%s] critical tool %s gated — returning confirmation", session.id, tool_name)
+                return AgentResult(text=text, tool_results=collected_tool_results)
 
             messages.append({"role": "assistant", "content": content})
             tool_msg = f"Tool result for {tool_name}:\n{json.dumps(tool_result, indent=2)}"
