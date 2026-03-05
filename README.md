@@ -26,7 +26,9 @@ No host Python install required — everything runs in containers.
 # 1. Clone and enter repo
 git clone <repo-url> && cd hobot
 
-# 2. Set Gemini API key (default provider)
+# 2. Set API keys (Anthropic is the default provider)
+export ANTHROPIC_API_KEY=your-anthropic-api-key
+# Optional: Gemini as fallback
 export GEMINI_API_KEY=your-gemini-api-key
 
 # 3. Build and start everything
@@ -65,11 +67,12 @@ First `docker compose up --build` takes a few minutes to build all images. Subse
 ```
                         ┌──────────────┐
                         │ LLM Provider │
-                        │ (Gemini /    │
+                        │ (Anthropic / │
+                        │ Gemini /     │
                         │ Ollama / Any)│
                         └──────▲───────┘
                                │ native tool_calls
-                               │ (OpenAI/Gemini)
+                               │ (Anthropic/Gemini/OpenAI)
                                │ or text JSON (Ollama)
 ┌──────────────────────────────┼──────────────────────────────────┐
 │  Clinibot Gateway (:3000)     │                                  │
@@ -227,7 +230,7 @@ All config files live in `config/` and are mounted into the gateway at `/app/con
 
 ### `config/config.json` — Providers + Model Routing
 
-Defines LLM providers and which one to use by default. The current default is **Google Gemini** (`gemini-2.0-flash`).
+Defines LLM providers and which one to use by default. The current default is **Anthropic Claude** (`claude-sonnet-4-20250514`).
 
 ```json
 {
@@ -253,22 +256,25 @@ Defines LLM providers and which one to use by default. The current default is **
   },
   "agents": {
     "defaults": {
-      "model": "gemini-2.0-flash",
-      "provider": "gemini"
+      "model": "claude-sonnet-4-20250514",
+      "provider": "anthropic"
     }
   }
 }
 ```
 
-**Three provider types are supported:**
+**Four provider types are supported:**
 
 | Provider type | Detection | Endpoint | Native Tools |
 |---------------|-----------|----------|--------------|
+| **AnthropicProvider** | Name contains `anthropic` or URL contains `api.anthropic.com` | `{baseUrl}/v1/messages` (native Messages API) | Yes — parallel |
 | **GeminiProvider** | Name contains `gemini` or URL contains `generativelanguage.googleapis.com` | `{baseUrl}/chat/completions` | Yes — parallel |
 | **OllamaProvider** | Name contains `ollama` or URL contains `/api/` | `{baseUrl}/api/chat` | No — text JSON fallback |
-| **OpenAICompatibleProvider** | Everything else (OpenAI, Anthropic, vLLM, etc.) | `{baseUrl}/v1/chat/completions` | Yes — parallel |
+| **OpenAICompatibleProvider** | Everything else (OpenAI, vLLM, etc.) | `{baseUrl}/v1/chat/completions` | Yes — parallel |
 
 Providers that support native function calling send tool definitions in the request and receive structured `tool_calls` in the response. The agent dispatches all tool calls in parallel via `asyncio.gather`. Ollama falls back to text-based JSON parsing (single tool per iteration).
+
+The **AnthropicProvider** uses the native Anthropic Messages API (`/v1/messages`) with `x-api-key` auth, `input_schema` tool format, and `tool_use`/`tool_result` content blocks — not the OpenAI compatibility layer.
 
 | Provider field | Description |
 |----------------|-------------|
@@ -278,7 +284,7 @@ Providers that support native function calling send tool definitions in the requ
 | `phi_safe` | If `false`, PHI is redacted before sending messages to this provider |
 | `timeout` | Request timeout in seconds (default: 60) |
 
-The `agents.defaults.provider` selects the global default. If the default provider is unavailable at runtime, the agent falls back to keyword-based intent detection.
+The `agents.defaults.provider` selects the global default. If the default provider is unavailable at runtime, the agent tries all other configured providers in order before falling back to keyword-based intent detection (see [Provider Fallback Chain](#provider-fallback-chain)).
 
 ### `config/tools.json` — Tool Criticality + Parameter Schemas
 
@@ -398,7 +404,7 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 
 | Domain | Tools | Backend |
 |--------|-------|---------|
-| **Monitoring** | `get_vitals`, `get_vitals_history`, `get_vitals_trend`, `list_wards`, `list_doctors`, `get_ward_patients`, `get_doctor_patients`, `get_patient_events`, `get_event_vitals`, `get_event_ecg`, `initiate_code_blue` | synthetic-monitoring |
+| **Monitoring** | `get_vitals`, `get_vitals_history`, `get_vitals_trend`, `list_wards`, `list_doctors`, `get_ward_patients`, `get_doctor_patients`, `get_patient_events`, `get_event_vitals`, `get_event_ecg`, `get_latest_ecg`, `initiate_code_blue` | synthetic-monitoring |
 | **EHR** | `get_patient`, `get_medications`, `get_allergies`, `get_orders`, `write_order` | synthetic-ehr (HAPI FHIR) |
 | **Radiology** | `get_studies`, `get_report`, `get_latest_study` | synthetic-radiology (Orthanc) |
 | **LIS** | `get_lab_results`, `get_lab_order`, `order_lab`, `get_order_status` | synthetic-lis |
@@ -414,15 +420,34 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 
 ### Multi-Provider LLM Routing
 
-The gateway supports multiple LLM backends through a provider abstraction layer (`providers.py`). All providers return a unified `ChatResult` (content + optional `ToolCall` list). Three provider types are built in:
+The gateway supports multiple LLM backends through a provider abstraction layer (`providers.py`). All providers return a unified `ChatResult` (content + optional `ToolCall` list). Four provider types are built in:
 
+- **AnthropicProvider** — Anthropic Claude via the native Messages API (`/v1/messages`). Supports native function calling with `tool_use`/`tool_result` content blocks.
 - **GeminiProvider** — Google Gemini via its OpenAI-compatible endpoint (`{baseUrl}/chat/completions`). Supports native function calling.
 - **OllamaProvider** — local GPU inference via Ollama `/api/chat`. Text-based tool parsing (single tool per iteration).
-- **OpenAICompatibleProvider** — any `/v1/chat/completions` API (OpenAI, Anthropic, vLLM, etc.). Supports native function calling.
+- **OpenAICompatibleProvider** — any `/v1/chat/completions` API (OpenAI, vLLM, etc.). Supports native function calling.
 
 Providers with native function calling receive structured tool definitions and can return multiple `tool_calls` in a single response. These are dispatched in parallel via `asyncio.gather`, significantly reducing latency for multi-tool queries.
 
-The default provider is **Gemini** (`gemini-2.0-flash`). Provider selection is configured in `config.json`. At runtime, the gateway checks provider health; if the default provider is down, the agent falls back to keyword-based intent detection.
+Provider selection is configured in `config.json`. At runtime, the gateway checks provider health and uses a fallback chain (see below).
+
+### Provider Fallback Chain
+
+When the default provider is unavailable or rate-limited, the gateway automatically tries other configured providers before falling to keyword regex:
+
+```
+Default provider (e.g. Anthropic) → other providers in config order (e.g. Gemini → Ollama) → keyword regex
+```
+
+`get_healthy_provider()` handles this at startup and mid-request. If a provider fails after tool calls are already collected (e.g. 429 on the synthesis step), the agent marks it unhealthy and tries a fallback provider for synthesis — tool results are never discarded.
+
+### Retry with Backoff
+
+All providers share a `_request_with_retry()` helper that retries on transient HTTP errors (429, 502, 503, 529) with exponential backoff (1s, 3s). After retries are exhausted, the provider returns `None` and the fallback chain takes over.
+
+### LLM Response Synthesis
+
+Tool results are synthesized into human-readable responses using the LLM provider. When no provider is available, built-in text formatters produce structured summaries for common tools (vitals, labs, meds, ECG, blood availability, patient services, etc.). The LLM synthesis prompt instructs the model to use bullet points, flag abnormal values, and keep responses under 10 lines.
 
 ### Session Persistence
 
@@ -460,18 +485,22 @@ Tokens are restored in the LLM response. Ollama (local) is marked `phi_safe: tru
 
 ### Keyword Fallback
 
-When no LLM provider is available, the agent uses regex-based intent detection to map messages to tools directly. Examples:
+When no LLM provider is available (all providers unhealthy), the agent uses regex-based intent detection to map messages to tools directly. Examples:
 - "vitals for P001" → `get_vitals(patient_id="P001")`
 - "vitals trend for P001" → `get_vitals_trend(patient_id="P001")`
 - "vitals trend over last 48 hours for P001" → `get_vitals_trend(patient_id="P001", hours=48)`
 - "list wards" → `list_wards()`
 - "lab results P001" → `get_lab_results(patient_id="P001")`
+- "get latest ECG for P001" → `get_latest_ecg(patient_id="P001")`
+- "ECG event EVT-001 for P001" → `get_event_ecg(event_id="EVT-001", patient_id="P001")`
 - "blood availability" → `get_blood_availability()`
 - "rounds report for ICU-A" → `get_ward_rounds(ward_id="ICU-A")`
 - "meds for bed 5" → `resolve_bed` → `get_medications(patient_id="P005")`
 - "vitals for patient in bed 3" → `resolve_bed` → `get_vitals(patient_id="P003")`
 - "schedule appointment with Dr Patel for patient in bed 5" → `schedule_appointment(...)`
 - "remind me in 2 hours to turn patient in bed 3" → `set_reminder(delay_minutes=120, ...)`
+
+Keyword results are synthesized through the LLM when a provider is available (used when the primary provider fails mid-request but a fallback exists), or formatted using built-in text formatters as a last resort.
 
 ### Vitals Trend Analysis with EWS Scoring
 
@@ -715,13 +744,13 @@ hobot/
 ├── clinibot/                 # Gateway (FastAPI, port 3000)
 │   ├── main.py              # App + endpoints (/chat, /chat/stream, /health, /confirm) + reminder background loop
 │   ├── agent.py             # Agent loop (native + text tool paths, parallel dispatch, consolidation, streaming)
-│   ├── providers.py         # LLM provider abstraction (Gemini, Ollama, OpenAI-compatible) + ChatResult/ToolCall
+│   ├── providers.py         # LLM provider abstraction (Anthropic, Gemini, Ollama, OpenAI-compatible) + fallback chain + retry
 │   ├── tools.py             # Tool registry + parallel dispatch + tool definitions + param validation + HTTP dispatch + critical gate + gateway tools
 │   ├── audit.py             # SQLite audit logging
 │   ├── clinical_memory.py   # Fact extraction + storage
 │   ├── session.py           # JSONL-backed session persistence
 │   ├── formatter.py         # Channel-aware response formatting + rich block rendering
-│   ├── blocks.py            # Tool result → abstract UI block mappers
+│   ├── blocks.py            # Tool result → abstract UI block mappers (incl. get_latest_ecg)
 │   ├── phi.py               # PHI redaction/restoration
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -750,11 +779,11 @@ hobot/
 # 1. Clone
 git clone <repo-url> && cd hobot
 
-# 2. Set Gemini API key (default provider)
-export GEMINI_API_KEY=your-gemini-api-key
-
-# 3. (Optional) Configure other provider keys
+# 2. Set Anthropic API key (default provider)
 export ANTHROPIC_API_KEY=sk-ant-...
+
+# 3. (Optional) Configure fallback provider keys
+export GEMINI_API_KEY=your-gemini-api-key
 
 # 4. Build and start the full stack
 docker compose up -d --build
@@ -764,7 +793,7 @@ docker compose up -d --build
 curl http://localhost:3000/health
 ```
 
-To use Ollama (local GPU) instead of Gemini, see [Change the Default LLM Model](#change-the-default-llm-model).
+To use Ollama (local GPU) instead of Anthropic, see [Change the Default LLM Model](#change-the-default-llm-model).
 
 ### Start
 
@@ -815,8 +844,8 @@ Edit `agents.defaults` in `config/config.json`:
 {
   "agents": {
     "defaults": {
-      "model": "gemini-2.0-flash",
-      "provider": "gemini"
+      "model": "claude-sonnet-4-20250514",
+      "provider": "anthropic"
     }
   }
 }
@@ -911,13 +940,27 @@ curl -s -X POST http://localhost:3000/chat \
 | Step | Logger | What you see |
 |------|--------|--------------|
 | 1. Request received | `clinibot` | FastAPI access log: `POST /chat` |
-| 2. Provider health check | `clinibot.providers` | `GET {provider}/models` (skipped if cached within 30s TTL) |
-| 3. LLM inference | `httpx` | `POST {provider}/chat/completions "HTTP/1.1 200 OK"` |
-| 4. Tool dispatch | `httpx` | `HTTP Request: GET http://synthetic-monitoring:8000/vitals/P001` |
-| 5. LLM synthesis | `httpx` | Second `POST .../chat/completions` (LLM summarizes tool result) |
-| 6. Response returned | `clinibot` | FastAPI response log |
+| 2. Provider selection | `clinibot.agent` | `[session-id] query="..." provider=anthropic` |
+| 3. Provider health check | `clinibot.providers` | `health_check provider=anthropic healthy=True` (skipped if cached within 30s TTL) |
+| 4. LLM iteration | `clinibot.agent` | `[session-id] llm iteration=0 provider=anthropic native_tools=True` |
+| 5. LLM request | `clinibot.providers` | `anthropic request: model=claude-sonnet-4-20250514 msgs=12 tools=41` |
+| 6. LLM response | `clinibot.providers` | `anthropic response: stop=tool_use input_tokens=... output_tokens=...` |
+| 7. Tool calls | `clinibot.agent` | `[session-id] llm requested tools: ['get_blood_availability']` |
+| 8. Tool dispatch | `clinibot.tools` | `[session-id] dispatch GET http://synthetic-bloodbank:8000/availability` |
+| 9. Tool result | `clinibot.agent` | `[session-id] tool_result: get_blood_availability params={} error=False` |
+| 10. Final response | `clinibot.agent` | `[session-id] final response: 245 chars, 1 tool_results` |
 
-If the LLM provider is down, steps 2-5 are replaced by keyword fallback (no LLM calls, just the backend tool call).
+If the provider hits rate limits (429), you'll see retry attempts:
+```
+clinibot.providers WARNING anthropic 429 — retry 1/2 in 1.0s
+clinibot.providers WARNING anthropic 429 — retry 2/2 in 3.0s
+```
+
+If retries exhaust and tool results were already collected, the agent falls back:
+```
+clinibot.agent WARNING [session-id] provider returned None after 1 tool results — synthesizing from collected data
+clinibot.agent INFO [session-id] using fallback provider 'gemini' for synthesis
+```
 
 ### Using the Streaming Endpoint for Tracing
 
@@ -1004,13 +1047,17 @@ docker compose exec clinibot-gateway head -1 /data/sessions/T1/<session_id>.json
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `"status":"degraded"` in `/health` | One or more backends down | Check `docker compose ps`, restart failed service |
-| All responses are keyword-formatted JSON | LLM provider unreachable | Check provider logs; for Gemini verify `GEMINI_API_KEY` is set; for Ollama check model is pulled |
+| All responses are keyword-formatted | All LLM providers unreachable | Check provider logs; verify API keys are set; for Ollama check model is pulled |
+| `anthropic 429 — retry` in logs | Anthropic rate limit | Normal — retries with backoff. If persistent, switch default provider or add rate limit headroom |
+| `provider returned None after N tool results` | Provider failed mid-synthesis | Normal — agent synthesizes from collected data using fallback provider or text formatters |
+| `No healthy providers available` | All configured providers down | Check API keys, network, and provider status pages |
 | `OpenAI-compatible chat failed` in logs | Cloud provider error (rate limit, auth, timeout) | Check API key, quota, and `docker compose logs clinibot-gateway` |
 | `Ollama chat failed` in logs | Model not loaded or OOM | `docker compose exec ollama ollama list`, check GPU memory |
+| `Anthropic chat failed` in logs | Auth error or API issue | Verify `ANTHROPIC_API_KEY` is set; check Anthropic status page |
 | `Invalid parameters:` error returned | Tool params failed validation | Check params against schema in `config/tools.json` |
 | Session not found after restart | Wrong `tenant_id` on follow-up request | `tenant_id` is part of the session path; must match |
-| 10s+ response times | Normal LLM inference for local models | Use a smaller model (`qwen2.5:7b`) or cloud provider |
-| Provider health check every request | Health cache expired (30s TTL) | Normal; first request after 30s incurs one `/api/tags` call |
+| 10s+ response times | Normal LLM inference for local models | Use a smaller model or cloud provider |
+| Provider health check every request | Health cache expired (30s TTL) | Normal; first request after 30s incurs one health probe |
 
 ---
 
@@ -1086,6 +1133,21 @@ Bot response (HTML):
 │ O-: 15 units                    │
 │ AB+: 20 units                   │
 │ AB-: 5 units                    │
+└──────────────────────────────────┘
+```
+
+**Latest ECG** — waveform data with lead summary:
+
+```
+User: Get latest ECG for P001
+
+Bot response (HTML):
+┌──────────────────────────────────┐
+│ ECG — P001                       │
+│ Condition: Normal Sinus Rhythm   │
+│ 7 leads, 500 Hz, 10s            │
+│ Leads: I, II, III, aVR, aVL,   │
+│        aVF, V1                   │
 └──────────────────────────────────┘
 ```
 
