@@ -42,6 +42,7 @@ class ProviderConfig:
     model: str
     phi_safe: bool
     timeout: float = 60.0
+    supports_vision: bool = False
 
 
 HEALTH_CACHE_TTL = 30  # seconds
@@ -483,6 +484,7 @@ def load_providers(config_path: str) -> None:
         model = pconf.get("model", default_model)
         phi_safe = pconf.get("phi_safe", False)
         timeout = pconf.get("timeout", 60.0)
+        supports_vision = pconf.get("supports_vision", False)
 
         config = ProviderConfig(
             name=name,
@@ -491,6 +493,7 @@ def load_providers(config_path: str) -> None:
             model=model,
             phi_safe=phi_safe,
             timeout=timeout,
+            supports_vision=supports_vision,
         )
         # Route to correct provider class based on name/URL
         if "ollama" in name.lower() or "/api/" in base_url:

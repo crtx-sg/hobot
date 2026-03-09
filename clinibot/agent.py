@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import analyzers
 import audit
 import clinical_memory
 import phi
@@ -55,7 +56,20 @@ To call a tool, respond with ONLY a JSON block like this (no other text):
 
 After receiving the tool result, synthesize a concise clinical response.
 Do NOT fabricate tool results. You MUST call the tool and wait for real data.
-Respond concisely and professionally. Use structured formatting when presenting clinical data."""
+Respond concisely and professionally. Use structured formatting when presenting clinical data.
+
+When you receive clinical data that would benefit from domain-specific interpretation:
+1. Gather patient context first (get_patient, get_medications if not already fetched)
+2. Then call the appropriate analyzer: analyze_lab_results, analyze_ecg, analyze_vitals, or analyze_radiology_image
+3. Use the analyzer's interpretation in your response, citing it
+4. If analyzer returns status "partial", note the limitation and reason in your response
+5. For radiology reports (get_report), summarization happens automatically — no need to call an analyzer
+
+Available analyzer tools:
+- analyze_lab_results: Interpret labs with patient history and medication context
+- analyze_ecg: Interpret ECG with patient history (interpretation depth depends on available model)
+- analyze_vitals: Assess vitals, NEWS2, trends against patient-specific targets
+- analyze_radiology_image: Vision model interprets medical images with patient context (requires study_id)"""
 
 
 def _supports_native_tools(provider) -> bool:
@@ -498,6 +512,7 @@ async def _run_with_provider(user_message: str, session: Session, provider) -> A
                 await _post_tool_hooks(
                     tr["tool"], tr["data"], tr["params"], session, provider.config.name
                 )
+                tr["data"] = await analyzers.maybe_analyze(tr["tool"], tr["data"], tr["params"], session)
             collected_tool_results.extend(tool_results)
 
             # If any tool returned awaiting_confirmation, return immediately
@@ -565,6 +580,7 @@ async def _run_with_provider(user_message: str, session: Session, provider) -> A
 
             tool_result = await call_tool(tool_name, params, session)
             await _post_tool_hooks(tool_name, tool_result, params, session, provider.config.name)
+            tool_result = await analyzers.maybe_analyze(tool_name, tool_result, params, session)
 
             collected_tool_results.append({"tool": tool_name, "params": params, "data": tool_result})
 
@@ -624,6 +640,7 @@ async def _run_with_keywords(user_message: str, session: Session, provider=None)
 
     tool_result = await call_tool(tool_name, params, session)
     await _post_tool_hooks(tool_name, tool_result, params, session, None)
+    tool_result = await analyzers.maybe_analyze(tool_name, tool_result, params, session)
 
     collected = [{"tool": tool_name, "params": params, "data": tool_result}]
 
@@ -738,6 +755,7 @@ async def run_agent_stream(user_message: str, session: Session) -> AsyncIterator
                 await _post_tool_hooks(
                     tr["tool"], tr["data"], tr["params"], session, provider.config.name
                 )
+                tr["data"] = await analyzers.maybe_analyze(tr["tool"], tr["data"], tr["params"], session)
                 yield {"type": "tool_result", "tool": tr["tool"], "data": tr["data"]}
 
             messages.append(result.raw_message)
@@ -775,6 +793,7 @@ async def run_agent_stream(user_message: str, session: Session) -> AsyncIterator
 
             tool_result = await call_tool(tool_name, params, session)
             await _post_tool_hooks(tool_name, tool_result, params, session, provider.config.name)
+            tool_result = await analyzers.maybe_analyze(tool_name, tool_result, params, session)
 
             yield {"type": "tool_result", "tool": tool_name, "data": tool_result}
 

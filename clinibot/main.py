@@ -72,6 +72,8 @@ async def lifespan(app: FastAPI):
     tools.load_tools_config(TOOLS_CONFIG)
     formatter.load_channels_config(CHANNELS_CONFIG)
     providers.load_providers(CONFIG_PATH)
+    import analyzers
+    analyzers.load_analyzer_config(CONFIG_PATH)
     reminder_task = asyncio.create_task(_reminder_loop())
     logger.info("Clinibot gateway started")
     yield

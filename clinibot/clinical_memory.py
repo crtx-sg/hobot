@@ -38,9 +38,28 @@ def _extract_list(result: dict, key: str, fact_type: str) -> list[dict]:
     return [{"fact_type": fact_type, "fact_data": result}]
 
 
+def _extract_ecg(result: dict, patient_id: str) -> list[dict]:
+    """Store ECG metadata without raw waveform arrays."""
+    meta = {
+        k: v for k, v in result.items()
+        if k not in ("leads", "waveform", "samples")
+    }
+    if "leads" in result and isinstance(result["leads"], dict):
+        meta["lead_names"] = list(result["leads"].keys())
+        meta["lead_count"] = len(result["leads"])
+    return [{"fact_type": "ecg", "fact_data": meta}]
+
+
+def _extract_vitals_trend(result: dict, patient_id: str) -> list[dict]:
+    """Store vitals trend analysis."""
+    trend = result.get("trend", result)
+    return [{"fact_type": "vitals_trend", "fact_data": trend}] if trend else []
+
+
 EXTRACTORS: dict[str, callable] = {
     "get_vitals": lambda r, pid: _extract_vitals(r, pid),
     "get_vitals_history": lambda r, pid: _extract_vitals(r, pid),
+    "get_vitals_trend": lambda r, pid: _extract_vitals_trend(r, pid),
     "get_medications": lambda r, pid: _extract_list(r, "medications", "medication"),
     "get_allergies": lambda r, pid: _extract_list(r, "allergies", "allergy"),
     "get_lab_results": lambda r, pid: _extract_list(r, "results", "lab_result"),
@@ -48,9 +67,17 @@ EXTRACTORS: dict[str, callable] = {
     "get_patient": lambda r, pid: [{"fact_type": "demographics", "fact_data": r}],
     "get_orders": lambda r, pid: _extract_list(r, "orders", "order"),
     "get_studies": lambda r, pid: _extract_list(r, "studies", "imaging_study"),
+    "get_latest_study": lambda r, pid: _extract_list(r, "studies", "imaging_study"),
     "get_report": lambda r, pid: [{"fact_type": "radiology_report", "fact_data": r}],
     "get_blood_availability": lambda r, pid: [{"fact_type": "blood_inventory", "fact_data": r}],
     "get_crossmatch_status": lambda r, pid: [{"fact_type": "crossmatch", "fact_data": r}],
+    "get_latest_ecg": lambda r, pid: _extract_ecg(r, pid),
+    "get_event_ecg": lambda r, pid: _extract_ecg(r, pid),
+    # Analyzer tool results
+    "analyze_lab_results": lambda r, pid: [{"fact_type": "lab_interpretation", "fact_data": r}],
+    "analyze_ecg": lambda r, pid: [{"fact_type": "ecg_interpretation", "fact_data": r}],
+    "analyze_vitals": lambda r, pid: [{"fact_type": "vitals_interpretation", "fact_data": r}],
+    "analyze_radiology_image": lambda r, pid: [{"fact_type": "radiology_interpretation", "fact_data": r}],
 }
 
 
@@ -66,6 +93,12 @@ async def extract_and_store(
     if not extractor or not patient_id:
         return 0
     facts = extractor(tool_result, patient_id)
+    # Store intercept analysis as a separate fact
+    if "_analysis" in tool_result:
+        facts.append({
+            "fact_type": f"{tool_name}_interpretation",
+            "fact_data": tool_result["_analysis"],
+        })
     for fact in facts:
         await store_fact(
             session_id=session_id,

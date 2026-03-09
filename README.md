@@ -4,7 +4,7 @@ Conversational clinical agent that unifies eight hospital systems behind a singl
 
 Built on a custom **clinibot gateway** (FastAPI) that orchestrates MCP tool servers, enforces clinical safety gates, extracts structured medical facts, and logs every action to an immutable audit trail.
 
-Supports **ward rounds reports** (severity-sorted with vitals, meds, scans), **bed-based queries** ("meds for patient in bed 5"), **appointment scheduling**, and **timed reminders** with Telegram push notifications.
+Supports **ward rounds reports** (severity-sorted with vitals, meds, scans), **bed-based queries** ("meds for patient in bed 5"), **appointment scheduling**, **timed reminders** with Telegram push notifications, and **specialized LLM analyzers** that provide domain-specific clinical interpretation of labs, ECGs, vitals, and medical images.
 
 ---
 
@@ -87,11 +87,11 @@ First `docker compose up --build` takes a few minutes to build all images. Subse
 │  │ (SQLite)   │  │ (fact extraction │  │ (non-PHI-safe      │  │
 │  └────────────┘  │  + consolidation)│  │  providers)        │  │
 │                  └──────────────────┘  └────────────────────┘  │
-│  ┌────────────┐  ┌──────────────────┐                          │
-│  │ Sessions   │  │ Response         │                          │
-│  │ (JSONL     │  │ Formatter        │                          │
-│  │  on disk)  │  │ (per-channel)    │                          │
-│  └────────────┘  └──────────────────┘                          │
+│  ┌────────────┐  ┌──────────────────┐  ┌────────────────────┐  │
+│  │ Sessions   │  │ Response         │  │ Analyzers          │  │
+│  │ (JSONL     │  │ Formatter        │  │ (intercept + tool  │  │
+│  │  on disk)  │  │ (per-channel)    │  │  domain LLMs)      │  │
+│  └────────────┘  └──────────────────┘  └────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -240,7 +240,8 @@ Defines LLM providers and which one to use by default. The current default is **
       "apiKey": "${GEMINI_API_KEY}",
       "model": "gemini-2.5-flash",
       "phi_safe": false,
-      "timeout": 30.0
+      "timeout": 30.0,
+      "supports_vision": true
     },
     "ollama": {
       "baseUrl": "http://ollama:11434",
@@ -251,13 +252,58 @@ Defines LLM providers and which one to use by default. The current default is **
       "baseUrl": "https://api.anthropic.com",
       "apiKey": "${ANTHROPIC_API_KEY}",
       "model": "claude-sonnet-4-20250514",
-      "phi_safe": false
+      "phi_safe": false,
+      "supports_vision": true
     }
   },
   "agents": {
     "defaults": {
       "model": "claude-sonnet-4-20250514",
       "provider": "anthropic"
+    }
+  },
+  "analyzers": {
+    "intercept": {
+      "get_report": {
+        "provider": "gemini",
+        "prompt_template": "radiology_report_summary",
+        "domain": "radiology"
+      }
+    },
+    "tools": {
+      "analyze_lab_results": {
+        "provider": "gemini",
+        "prompt_template": "lab_analysis",
+        "domain": "pathology",
+        "source_fact_types": ["lab_result"],
+        "context_types": ["demographics", "medication", "allergy"]
+      },
+      "analyze_ecg": {
+        "provider": "ollama",
+        "prompt_template": "ecg_analysis",
+        "domain": "cardiology",
+        "preprocessor": "ecg_stub",
+        "source_fact_types": ["ecg"],
+        "context_types": ["demographics", "medication"]
+      },
+      "analyze_vitals": {
+        "provider": "gemini",
+        "prompt_template": "vitals_analysis",
+        "domain": "critical_care",
+        "source_fact_types": ["vitals", "vitals_trend"],
+        "context_types": ["demographics", "medication", "allergy"]
+      },
+      "analyze_radiology_image": {
+        "provider": "gemini",
+        "prompt_template": "radiology_image_analysis",
+        "domain": "radiology",
+        "input_type": "image_wado",
+        "context_types": ["demographics", "medication", "imaging_study"]
+      }
+    },
+    "defaults": {
+      "fallback": "passthrough",
+      "timeout": 15
     }
   }
 }
@@ -283,6 +329,7 @@ The **AnthropicProvider** uses the native Anthropic Messages API (`/v1/messages`
 | `model` | Model name/ID sent to the provider |
 | `phi_safe` | If `false`, PHI is redacted before sending messages to this provider |
 | `timeout` | Request timeout in seconds (default: 60) |
+| `supports_vision` | If `true`, provider can process image inputs (used by `analyze_radiology_image`) |
 
 The `agents.defaults.provider` selects the global default. If the default provider is unavailable at runtime, the agent tries all other configured providers in order before falling back to keyword-based intent detection (see [Provider Fallback Chain](#provider-fallback-chain)).
 
@@ -366,6 +413,37 @@ Controls how responses are formatted and which block types are supported per out
 | `parse_mode` | Telegram-specific: `"HTML"` for rich rendering |
 | `supported_blocks` | Block types this channel can render. Unsupported types are stripped from the `blocks` array before returning |
 
+### `config/config.json` — Analyzers Section
+
+The `analyzers` section configures domain-specific clinical interpretation. See [Specialized LLM Analyzers](#specialized-llm-analyzers) for the full feature description.
+
+**Intercept config fields:**
+
+| Field | Description |
+|-------|-------------|
+| `provider` | Which LLM provider to use for analysis |
+| `prompt_template` | Key into `analyzer_prompts.py` template dict |
+| `domain` | Clinical domain label (`"radiology"`, etc.) |
+
+**Tool analyzer config fields:**
+
+| Field | Description |
+|-------|-------------|
+| `provider` | Which LLM provider to use |
+| `prompt_template` | Key into `analyzer_prompts.py` template dict |
+| `domain` | Clinical domain label |
+| `source_fact_types` | Fact types in clinical memory containing the raw data to analyze |
+| `context_types` | Fact types to fetch as patient context (demographics, meds, etc.) |
+| `preprocessor` | Optional preprocessor name (e.g. `"ecg_stub"`) |
+| `input_type` | `"image_wado"` for image-based analyzers (fetches from Orthanc) |
+
+**Defaults:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `fallback` | `"passthrough"` | Behavior when no analyzer configured |
+| `timeout` | `15` | Seconds before analyzer times out |
+
 ---
 
 ## Environment Variables
@@ -413,6 +491,7 @@ The gateway exposes 30+ tools across 8 clinical domains. Each tool maps to a dir
 | **ERP** | `get_inventory`, `get_equipment_status`, `place_supply_order` | synthetic-erp |
 | **Patient Services** | `request_housekeeping`, `order_diet`, `request_ambulance`, `get_request_status` | synthetic-patient-services |
 | **Gateway** | `escalate`, `get_ward_rounds`, `resolve_bed`, `schedule_appointment`, `set_reminder` | clinibot (internal) |
+| **Analyzers** | `analyze_lab_results`, `analyze_ecg`, `analyze_vitals`, `analyze_radiology_image` | clinibot (domain LLMs) |
 
 ---
 
@@ -448,6 +527,65 @@ All providers share a `_request_with_retry()` helper that retries on transient H
 ### LLM Response Synthesis
 
 Tool results are synthesized into human-readable responses using the LLM provider. When no provider is available, built-in text formatters produce structured summaries for common tools (vitals, labs, meds, ECG, blood availability, patient services, etc.). The LLM synthesis prompt instructs the model to use bullet points, flag abnormal values, and keep responses under 10 lines.
+
+### Specialized LLM Analyzers
+
+Raw clinical data (labs, ECGs, vitals, images) is fed to domain-specific LLM analyzers for context-aware interpretation. Two analyzer types exist:
+
+**Intercept analyzers** auto-fire on tool results that are self-contained and need only summarization. Currently, `get_report` (radiology reports) is the only intercept — the radiologist-authored text is summarized and attached as an `_analysis` key on the tool result. The main LLM sees both the raw report and the summary. Intercept failures are silent — the raw data passes through unchanged.
+
+**Tool analyzers** are registered as gateway tools (`analyze_lab_results`, `analyze_ecg`, `analyze_vitals`, `analyze_radiology_image`) that the main LLM dispatches after gathering patient context. This ensures clinical interpretation quality: the same lab values mean different things for a 72-year-old with CKD on ACE inhibitors vs. a healthy 25-year-old.
+
+**Data flow:** Tool analyzers pull source data from clinical memory (stored by data-fetch tools in a prior turn) and patient context (demographics, medications, allergies). They build a domain prompt, call a specialized provider (Gemini for vision/text, Ollama for local/PHI-safe), and return a standardized `AnalyzerResult`.
+
+**AnalyzerResult format:**
+
+| Field | Description |
+|-------|-------------|
+| `status` | `"success"`, `"partial"`, or `"error"` |
+| `status_reason` | Why partial/error: `"incomplete_context"`, `"limited_capability"`, `"timeout"`, `"no_source_data"` |
+| `domain` | `"pathology"`, `"cardiology"`, `"critical_care"`, `"radiology"` |
+| `interpretation` | Free-text clinical interpretation (primary output) |
+| `findings` | Structured findings list (for UI rendering, fact storage) |
+| `context_used` | Which fact types were available for context |
+| `context_summary` | One-line patient summary used by analyzer |
+| `analyzer_provider` | Which provider ran the analysis |
+| `analyzer_model` | Model identifier |
+
+**Status semantics:** `status` reflects two independent dimensions — context completeness and analyzer capability. Missing demographics/meds yields `"incomplete_context"`. The ECG stub preprocessor (no ML model yet) yields `"limited_capability"`. Both can combine. The main LLM is instructed to note limitations when status is `"partial"`.
+
+**Analyzer tools:**
+
+| Tool | Domain | Provider | Required Context | Source Data |
+|------|--------|----------|-----------------|-------------|
+| `analyze_lab_results` | Pathology | Gemini | demographics, meds, allergies | Lab results from clinical memory |
+| `analyze_ecg` | Cardiology | Ollama | demographics, meds | ECG metadata from clinical memory (stub preprocessor strips waveforms) |
+| `analyze_vitals` | Critical care | Gemini | demographics, meds, allergies | Vitals + trend data from clinical memory |
+| `analyze_radiology_image` | Radiology | Gemini (vision) | demographics, meds, imaging study | Image fetched from Orthanc via WADO |
+
+**Example flow (labs):**
+```
+User: "Interpret labs for bed 5"
+  Turn 1: LLM → resolve_bed(5) → P005
+          LLM → get_lab_results(P005), get_patient(P005), get_medications(P005)
+          → all results stored as facts in clinical memory
+  Turn 2: LLM → analyze_lab_results(patient_id="P005")
+          → fetches lab data + patient context from clinical memory
+          → builds domain prompt → Gemini → AnalyzerResult
+  Turn 3: LLM synthesizes: "Lab analysis shows BUN elevated but expected for CKD..."
+```
+
+**Error handling:**
+- Intercept timeout (15s) → log warning, return raw data unchanged
+- Tool analyzer timeout (15s) → return `{status: "error", status_reason: "timeout"}`
+- Provider unhealthy → intercept: skip. Tool: error result
+- Source data not in memory → `{status: "error", status_reason: "no_source_data"}`
+- Missing context → `{status: "partial", status_reason: "incomplete_context"}` (analysis still proceeds with available context)
+- PHI: if analyzer provider is not `phi_safe`, context is redacted before sending and interpretation is restored after
+
+**Preprocessors:** The ECG analyzer uses a pluggable preprocessor (`ecg_stub`) that strips waveform arrays and returns metadata only with capability `"limited"`. When a future ML preprocessor is configured (`ecg_ml`), the same prompt receives richer data and returns capability `"full"` — no prompt changes needed.
+
+**Configuration:** Analyzers are configured in the `analyzers` section of `config/config.json`. See [Configuration](#configuration) for the full schema.
 
 ### Session Persistence
 
@@ -676,7 +814,7 @@ Each execution path shares:
 
 Every tool call result is automatically parsed into structured **clinical facts** and stored in SQLite. Facts are never summarized or discarded.
 
-Supported fact types: `vitals`, `medication`, `allergy`, `lab_result`, `lab_order`, `demographics`, `order`, `imaging_study`, `radiology_report`, `blood_inventory`, `crossmatch`.
+Supported fact types: `vitals`, `vitals_trend`, `medication`, `allergy`, `lab_result`, `lab_order`, `demographics`, `order`, `imaging_study`, `radiology_report`, `blood_inventory`, `crossmatch`, `ecg`, `lab_interpretation`, `ecg_interpretation`, `vitals_interpretation`, `radiology_interpretation`.
 
 Facts are injected into the LLM context for active patients, so the agent has full clinical history without re-querying backends.
 
@@ -748,6 +886,8 @@ hobot/
 │   ├── tools.py             # Tool registry + parallel dispatch + tool definitions + param validation + HTTP dispatch + critical gate + gateway tools
 │   ├── audit.py             # SQLite audit logging
 │   ├── clinical_memory.py   # Fact extraction + storage
+│   ├── analyzers.py         # Specialized LLM analyzers (intercept + tool) + preprocessors + vision
+│   ├── analyzer_prompts.py  # Domain-specific prompt templates for analyzers
 │   ├── session.py           # JSONL-backed session persistence
 │   ├── formatter.py         # Channel-aware response formatting + rich block rendering
 │   ├── blocks.py            # Tool result → abstract UI block mappers (incl. get_latest_ecg)

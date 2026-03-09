@@ -342,6 +342,9 @@ def build_tool_definitions() -> list[dict]:
             "description": _TOOL_DESCRIPTIONS.get(name, name),
             "parameters": _schema_to_openai_params(name),
         })
+    # Append analyzer tool definitions
+    import analyzers
+    defs.extend(analyzers.get_analyzer_tool_definitions())
     return defs
 
 
@@ -377,6 +380,11 @@ async def call_tool(
     validation_error = validate_params(tool_name, params)
     if validation_error:
         return {"error": f"Invalid parameters: {validation_error}"}
+
+    # Analyzer tools
+    if tool_name.startswith("analyze_"):
+        import analyzers
+        return await analyzers.run_analyzer_tool(tool_name, params, session)
 
     # Gateway-level: escalate
     if tool_name == "escalate":

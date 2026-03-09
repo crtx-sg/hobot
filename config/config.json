@@ -5,7 +5,8 @@
       "apiKey": "${GEMINI_API_KEY}",
       "model": "gemini-2.5-flash",
       "phi_safe": false,
-      "timeout": 30.0
+      "timeout": 30.0,
+      "supports_vision": true
     },
     "ollama": {
       "baseUrl": "http://ollama:11434",
@@ -16,13 +17,59 @@
       "baseUrl": "https://api.anthropic.com",
       "apiKey": "${ANTHROPIC_API_KEY}",
       "model": "claude-sonnet-4-20250514",
-      "phi_safe": false
+      "phi_safe": false,
+      "supports_vision": true
     }
   },
   "agents": {
     "defaults": {
       "model": "claude-sonnet-4-20250514",
       "provider": "anthropic"
+    }
+  },
+  "analyzers": {
+    "intercept": {
+      "get_report": {
+        "provider": "gemini",
+        "prompt_template": "radiology_report_summary",
+        "domain": "radiology",
+        "input_type": "structured"
+      }
+    },
+    "tools": {
+      "analyze_lab_results": {
+        "provider": "gemini",
+        "prompt_template": "lab_analysis",
+        "domain": "pathology",
+        "source_fact_types": ["lab_result"],
+        "context_types": ["demographics", "medication", "allergy"]
+      },
+      "analyze_ecg": {
+        "provider": "ollama",
+        "prompt_template": "ecg_analysis",
+        "domain": "cardiology",
+        "preprocessor": "ecg_stub",
+        "source_fact_types": ["ecg"],
+        "context_types": ["demographics", "medication"]
+      },
+      "analyze_vitals": {
+        "provider": "gemini",
+        "prompt_template": "vitals_analysis",
+        "domain": "critical_care",
+        "source_fact_types": ["vitals", "vitals_trend"],
+        "context_types": ["demographics", "medication", "allergy"]
+      },
+      "analyze_radiology_image": {
+        "provider": "gemini",
+        "prompt_template": "radiology_image_analysis",
+        "domain": "radiology",
+        "input_type": "image_wado",
+        "context_types": ["demographics", "medication", "imaging_study"]
+      }
+    },
+    "defaults": {
+      "fallback": "passthrough",
+      "timeout": 15
     }
   }
 }
