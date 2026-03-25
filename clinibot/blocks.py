@@ -13,6 +13,8 @@ def build_blocks(tool_results: list[dict]) -> list[dict]:
         data = tr.get("data", {})
         params = tr.get("params", {})
         # Check for confirmation-gated results first (any critical tool)
+        if not isinstance(data, dict):
+            continue
         if data.get("status") == "awaiting_confirmation":
             blocks.extend(_build_confirmation_blocks(data, params))
             continue

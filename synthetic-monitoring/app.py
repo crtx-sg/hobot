@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import h5py
 import numpy as np
 from scipy.stats import linregress
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 
 from hdf5_generator import DATA_DIR, ECG_LEADS, generate_all
 
@@ -110,6 +110,73 @@ BED_MAP: dict[str, str] = {
     "BED4": "P004", "BED5": "P005",
 }
 BED_PATIENT: dict[str, str] = {v: k for k, v in BED_MAP.items()}
+
+# ---------------------------------------------------------------------------
+# Clinical Alarms (in-memory)
+# ---------------------------------------------------------------------------
+
+ALARMS_DB: dict[str, dict] = {}
+
+def _seed_alarms() -> None:
+    now = datetime.now(timezone.utc)
+    seed = [
+        {
+            "alarm_id": "ALM-001",
+            "patient_id": "P003",
+            "type": "vitals_breach",
+            "parameter": "heart_rate",
+            "severity": "critical",
+            "message": "Heart rate 128 bpm exceeds critical threshold (>130 approaching)",
+            "triggered_at": (now - timedelta(minutes=12)).isoformat(),
+            "status": "active",
+            "cleared_by": None,
+            "cleared_at": None,
+            "clear_reason": None,
+        },
+        {
+            "alarm_id": "ALM-002",
+            "patient_id": "P003",
+            "type": "vitals_breach",
+            "parameter": "spo2",
+            "severity": "critical",
+            "message": "SpO2 dropped to 91% — below critical threshold (92%)",
+            "triggered_at": (now - timedelta(minutes=8)).isoformat(),
+            "status": "active",
+            "cleared_by": None,
+            "cleared_at": None,
+            "clear_reason": None,
+        },
+        {
+            "alarm_id": "ALM-003",
+            "patient_id": "P003",
+            "type": "ventilator",
+            "parameter": "fio2",
+            "severity": "warning",
+            "message": "FiO2 auto-increased to 60% by ventilator",
+            "triggered_at": (now - timedelta(minutes=5)).isoformat(),
+            "status": "active",
+            "cleared_by": None,
+            "cleared_at": None,
+            "clear_reason": None,
+        },
+        {
+            "alarm_id": "ALM-004",
+            "patient_id": "P001",
+            "type": "infusion_pump",
+            "parameter": "flow_rate",
+            "severity": "warning",
+            "message": "Infusion pump occlusion detected on Line A",
+            "triggered_at": (now - timedelta(minutes=20)).isoformat(),
+            "status": "active",
+            "cleared_by": None,
+            "cleared_at": None,
+            "clear_reason": None,
+        },
+    ]
+    for alarm in seed:
+        ALARMS_DB[alarm["alarm_id"]] = alarm
+
+_seed_alarms()
 
 # Reverse maps
 PATIENT_WARD: dict[str, str] = {}
@@ -360,6 +427,32 @@ def get_ward_patients(ward_id: str):
     return {"ward_id": ward_id, "patients": patients}
 
 
+@app.get("/doctor/resolve")
+def resolve_doctor(name: str = Query(..., min_length=1)):
+    """Fuzzy-match a doctor name against DOCTOR_MAP keys."""
+    query = name.strip().upper().replace("DR ", "").replace("DR. ", "").replace(".", "")
+    best_key = None
+    for key in DOCTOR_MAP:
+        # Strip 'DR-' prefix for comparison
+        bare = key.replace("DR-", "")
+        if query == bare or query == key:
+            best_key = key
+            break
+        if bare.startswith(query) or query.startswith(bare):
+            best_key = key
+            break
+        if query in bare or bare in query:
+            best_key = key
+            break
+    if best_key is None:
+        raise HTTPException(status_code=404, detail=f"No doctor matching '{name}'")
+    return {
+        "doctor_id": best_key,
+        "name": best_key,
+        "patients": DOCTOR_MAP[best_key],
+    }
+
+
 @app.get("/doctor/{doctor_id}/patients")
 def get_doctor_patients(doctor_id: str):
     pids = DOCTOR_MAP.get(doctor_id)
@@ -376,7 +469,10 @@ def get_doctor_patients(doctor_id: str):
 
 @app.get("/bed/{bed_id}/patient")
 def get_bed_patient(bed_id: str):
-    bed_key = bed_id.upper().replace(" ", "")
+    bed_key = bed_id.strip().upper().replace(" ", "")
+    # Normalize: "2" → "BED2", "bed2" → "BED2"
+    if bed_key and not bed_key.startswith("BED"):
+        bed_key = f"BED{bed_key}"
     pid = BED_MAP.get(bed_key)
     if pid is None:
         raise HTTPException(status_code=404, detail=f"Bed {bed_id} not found")
@@ -484,15 +580,22 @@ def _read_event_ecg(patient_id: str, event_id: str) -> dict:
 
 
 @app.get("/ecg/{patient_id}/latest")
-def get_latest_ecg(patient_id: str):
-    """Return the most recent ECG for a patient (no event_id needed)."""
+def get_latest_ecg(patient_id: str, duration: int = Query(default=10, ge=1, le=300)):
+    """Return the most recent ECG for a patient (no event_id needed).
+
+    Args:
+        duration: Requested duration in seconds. Included in response metadata.
+                  Synthetic data is fixed-length so this is informational only.
+    """
     events = EVENT_INDEX.get(patient_id)
     if not events:
         raise HTTPException(status_code=404, detail=f"Patient {patient_id} not found")
     # Sort by timestamp descending, take the first
     sorted_events = sorted(events, key=lambda e: e["timestamp"], reverse=True)
     latest = sorted_events[0]
-    return _read_event_ecg(patient_id, latest["event_id"])
+    result = _read_event_ecg(patient_id, latest["event_id"])
+    result["requested_duration_s"] = duration
+    return result
 
 
 @app.get("/events/{patient_id}/{event_id}/vitals")
@@ -503,3 +606,145 @@ def get_event_vitals(patient_id: str, event_id: str):
 @app.get("/events/{patient_id}/{event_id}/ecg")
 def get_event_ecg(patient_id: str, event_id: str):
     return _read_event_ecg(patient_id, event_id)
+
+
+# ---------------------------------------------------------------------------
+# Patient-specific vital sign thresholds
+# ---------------------------------------------------------------------------
+# In a real system these come from physician orders or care plans in the EHR.
+# The synthetic backend returns realistic per-patient thresholds.
+
+_PATIENT_THRESHOLDS: dict[str, dict] = {
+    # P003 (deteriorating): tighter thresholds per physician order
+    "P003": {
+        "heart_rate":       {"low": 50, "high": 90, "critical_low": 40, "critical_high": 130},
+        "bp_systolic":      {"low": 100, "high": 140, "critical_low": 80, "critical_high": 200},
+        "spo2":             {"low": 95, "critical_low": 92},
+        "temperature":      {"low": 36.1, "high": 37.5, "critical_low": 35.0, "critical_high": 39.0},
+        "respiration_rate": {"low": 12, "high": 20, "critical_low": 8, "critical_high": 28},
+    },
+    # P005 (cardiac): tighter HR and BP targets
+    "P005": {
+        "heart_rate":       {"low": 55, "high": 85, "critical_low": 40, "critical_high": 120},
+        "bp_systolic":      {"low": 90, "high": 130, "critical_low": 70, "critical_high": 180},
+        "bp_diastolic":     {"low": 60, "high": 80, "critical_low": 40, "critical_high": 110},
+        "spo2":             {"low": 94, "critical_low": 90},
+        "temperature":      {"low": 36.1, "high": 38.0, "critical_low": 35.0, "critical_high": 39.5},
+        "respiration_rate": {"low": 12, "high": 20, "critical_low": 8, "critical_high": 30},
+    },
+}
+
+# Default thresholds returned when no patient-specific thresholds exist
+_DEFAULT_THRESHOLDS = {
+    "heart_rate":       {"low": 60, "high": 100, "critical_low": 40, "critical_high": 150},
+    "bp_systolic":      {"low": 90, "high": 140, "critical_low": 70, "critical_high": 220},
+    "bp_diastolic":     {"low": 60, "high": 90, "critical_low": 40, "critical_high": 120},
+    "spo2":             {"low": 94, "critical_low": 90},
+    "temperature":      {"low": 36.1, "high": 38.0, "critical_low": 35.0, "critical_high": 39.5},
+    "respiration_rate": {"low": 12, "high": 20, "critical_low": 8, "critical_high": 30},
+}
+
+
+@app.get("/thresholds/{patient_id}")
+def get_patient_thresholds(patient_id: str):
+    """Return vital sign thresholds for a patient.
+
+    Returns patient-specific thresholds if configured (e.g. physician orders),
+    otherwise returns hospital defaults.
+    """
+    if patient_id not in VITALS_DB and patient_id not in _PATIENT_THRESHOLDS:
+        raise HTTPException(status_code=404, detail=f"Patient {patient_id} not found")
+    thresholds = _PATIENT_THRESHOLDS.get(patient_id, _DEFAULT_THRESHOLDS)
+    return {
+        "patient_id": patient_id,
+        "source": "patient_specific" if patient_id in _PATIENT_THRESHOLDS else "hospital_default",
+        "thresholds": thresholds,
+    }
+
+
+@app.put("/thresholds/{patient_id}")
+def update_patient_thresholds(patient_id: str, body: dict = Body(...)):
+    """Partial-update vital sign thresholds for a patient.
+
+    Merges provided fields into existing thresholds (patient-specific or defaults).
+    """
+    if patient_id not in VITALS_DB and patient_id not in _PATIENT_THRESHOLDS:
+        raise HTTPException(status_code=404, detail=f"Patient {patient_id} not found")
+    import copy
+    existing = copy.deepcopy(_PATIENT_THRESHOLDS.get(patient_id, _DEFAULT_THRESHOLDS))
+    for param, limits in body.items():
+        if param in existing and isinstance(limits, dict):
+            existing[param].update(limits)
+        else:
+            existing[param] = limits
+    _PATIENT_THRESHOLDS[patient_id] = existing
+    return {
+        "patient_id": patient_id,
+        "source": "patient_specific",
+        "thresholds": existing,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Clinical Alarm endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/alarms/{patient_id}")
+def get_alarms(patient_id: str, status: str | None = None):
+    """Return alarms for a patient, optionally filtered by status."""
+    alarms = [
+        a for a in ALARMS_DB.values()
+        if a["patient_id"] == patient_id
+    ]
+    filter_status = status or "active"
+    alarms = [a for a in alarms if a["status"] == filter_status]
+    return {"patient_id": patient_id, "alarms": alarms}
+
+
+@app.post("/alarms/{alarm_id}/clear")
+def clear_alarm(alarm_id: str, body: dict = Body(...)):
+    """Clear an active alarm."""
+    alarm = ALARMS_DB.get(alarm_id)
+    if alarm is None:
+        raise HTTPException(status_code=404, detail=f"Alarm {alarm_id} not found")
+    cleared_by = body.get("cleared_by")
+    reason = body.get("reason")
+    if not cleared_by or not reason:
+        raise HTTPException(status_code=422, detail="cleared_by and reason are required")
+    alarm["status"] = "cleared"
+    alarm["cleared_by"] = cleared_by
+    alarm["cleared_at"] = datetime.now(timezone.utc).isoformat()
+    alarm["clear_reason"] = reason
+    return alarm
+
+
+# ---------------------------------------------------------------------------
+# Conditions / Comorbidities
+# ---------------------------------------------------------------------------
+
+CONDITIONS_DB: dict[str, list[dict]] = {
+    "P001": [
+        {"code": "I10", "description": "Essential hypertension", "status": "active", "diagnosed_date": "2022-03-15", "severity": "moderate"},
+        {"code": "E11", "description": "Type 2 diabetes mellitus", "status": "active", "diagnosed_date": "2020-08-01", "severity": "moderate"},
+    ],
+    "P003": [
+        {"code": "A41.9", "description": "Sepsis, unspecified organism", "status": "active", "diagnosed_date": "2026-03-20", "severity": "severe"},
+        {"code": "N17.9", "description": "Acute kidney injury, unspecified", "status": "active", "diagnosed_date": "2026-03-21", "severity": "moderate"},
+        {"code": "J44.1", "description": "Chronic obstructive pulmonary disease with acute exacerbation", "status": "active", "diagnosed_date": "2019-11-10", "severity": "moderate"},
+    ],
+    "P005": [
+        {"code": "I50.9", "description": "Heart failure, unspecified", "status": "active", "diagnosed_date": "2023-06-12", "severity": "moderate"},
+        {"code": "I48.0", "description": "Paroxysmal atrial fibrillation", "status": "active", "diagnosed_date": "2023-07-03", "severity": "moderate"},
+    ],
+}
+
+
+@app.get("/conditions/{patient_id}")
+def get_conditions(patient_id: str, status: str | None = None):
+    """Return conditions/comorbidities for a patient, optionally filtered by status."""
+    if patient_id not in VITALS_DB and patient_id not in CONDITIONS_DB:
+        raise HTTPException(status_code=404, detail=f"Patient {patient_id} not found")
+    conditions = CONDITIONS_DB.get(patient_id, [])
+    if status:
+        conditions = [c for c in conditions if c["status"] == status]
+    return {"patient_id": patient_id, "conditions": conditions}

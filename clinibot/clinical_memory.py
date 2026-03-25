@@ -5,7 +5,47 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+from db_utils import retry_execute
+
 _db: aiosqlite.Connection | None = None
+_ttl_config: dict = {}
+
+
+def _compute_expires_at(fact_type: str, now_iso: str) -> str | None:
+    """Compute expiry timestamp from TTL config. Returns None if no TTL configured."""
+    ttl_hours = _ttl_config.get(fact_type)
+    if not ttl_hours:
+        return None
+    from datetime import timedelta
+    now = datetime.fromisoformat(now_iso)
+    return (now + timedelta(hours=ttl_hours)).isoformat()
+
+
+_cleanup_interval_minutes: int = 30
+
+
+def load_memory_config(config_path: str) -> None:
+    """Load clinical_memory TTL config from config.json."""
+    global _ttl_config, _cleanup_interval_minutes
+    import os
+    if not os.path.exists(config_path):
+        return
+    with open(config_path) as f:
+        data = json.load(f)
+    mem_cfg = data.get("clinical_memory", {})
+    _ttl_config = mem_cfg.get("ttl_hours", {})
+    _cleanup_interval_minutes = mem_cfg.get("cleanup_interval_minutes", 30)
+
+
+async def cleanup_expired() -> int:
+    """Delete expired clinical facts. Returns count deleted."""
+    if _db is None:
+        return 0
+    cur = await retry_execute(
+        _db,
+        "DELETE FROM clinical_facts WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')",
+    )
+    return cur.rowcount if cur else 0
 
 
 def bind_db(db: aiosqlite.Connection) -> None:
@@ -78,6 +118,10 @@ EXTRACTORS: dict[str, callable] = {
     "analyze_ecg": lambda r, pid: [{"fact_type": "ecg_interpretation", "fact_data": r}],
     "analyze_vitals": lambda r, pid: [{"fact_type": "vitals_interpretation", "fact_data": r}],
     "analyze_radiology_image": lambda r, pid: [{"fact_type": "radiology_interpretation", "fact_data": r}],
+    "get_patient_thresholds": lambda r, pid: [{"fact_type": "vitals_thresholds", "fact_data": r.get("thresholds", r)}],
+    "get_active_alarms": lambda r, pid: _extract_list(r, "alarms", "alarm"),
+    "update_patient_thresholds": lambda r, pid: [{"fact_type": "vitals_thresholds", "fact_data": r.get("thresholds", r)}],
+    "get_conditions": lambda r, pid: _extract_list(r, "conditions", "condition"),
 }
 
 
@@ -122,13 +166,14 @@ async def store_fact(
     """Insert a clinical fact into the database."""
     assert _db is not None, "clinical_memory db not bound"
     now = datetime.now(timezone.utc).isoformat()
-    await _db.execute(
+    expires_at = _compute_expires_at(fact_type, now)
+    await retry_execute(
+        _db,
         """INSERT INTO clinical_facts
-           (session_id, tenant_id, patient_id, fact_type, fact_data, source_tool, recorded_at)
-           VALUES (?,?,?,?,?,?,?)""",
-        (session_id, tenant_id, patient_id, fact_type, json.dumps(fact_data), source_tool, now),
+           (session_id, tenant_id, patient_id, fact_type, fact_data, source_tool, recorded_at, expires_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (session_id, tenant_id, patient_id, fact_type, json.dumps(fact_data), source_tool, now, expires_at),
     )
-    await _db.commit()
 
 
 async def get_facts(
@@ -139,20 +184,23 @@ async def get_facts(
 ) -> list[dict]:
     """Retrieve recent clinical facts for a patient."""
     assert _db is not None, "clinical_memory db not bound"
+    ttl_filter = " AND (expires_at IS NULL OR expires_at > datetime('now'))"
     if fact_type:
         cur = await _db.execute(
             """SELECT fact_type, fact_data, source_tool, recorded_at
                FROM clinical_facts
-               WHERE patient_id=? AND tenant_id=? AND fact_type=?
-               ORDER BY recorded_at DESC LIMIT ?""",
+               WHERE patient_id=? AND tenant_id=? AND fact_type=?"""
+            + ttl_filter
+            + " ORDER BY recorded_at DESC LIMIT ?",
             (patient_id, tenant_id, fact_type, limit),
         )
     else:
         cur = await _db.execute(
             """SELECT fact_type, fact_data, source_tool, recorded_at
                FROM clinical_facts
-               WHERE patient_id=? AND tenant_id=?
-               ORDER BY recorded_at DESC LIMIT ?""",
+               WHERE patient_id=? AND tenant_id=?"""
+            + ttl_filter
+            + " ORDER BY recorded_at DESC LIMIT ?",
             (patient_id, tenant_id, limit),
         )
     rows = await cur.fetchall()

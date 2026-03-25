@@ -26,6 +26,13 @@ logger = logging.getLogger("telegram-bot")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://clinibot-gateway:3000")
 TENANT_ID = os.environ.get("TENANT_ID", "default")
+_API_KEY = os.environ.get("API_KEY", "")
+
+def _auth_headers() -> dict[str, str]:
+    """Return Authorization header if API_KEY is set."""
+    if _API_KEY:
+        return {"Authorization": f"Bearer {_API_KEY}"}
+    return {}
 
 TG_MAX_LENGTH = 4096
 
@@ -87,7 +94,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(f"{GATEWAY_URL}/chat", json=payload)
+            resp = await client.post(f"{GATEWAY_URL}/chat", json=payload, headers=_auth_headers())
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPStatusError as exc:
@@ -207,7 +214,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(f"{GATEWAY_URL}/confirm/{cid}")
+                resp = await client.post(f"{GATEWAY_URL}/confirm/{cid}", headers=_auth_headers())
                 resp.raise_for_status()
                 result = resp.json()
             result_text = json.dumps(result.get("result", result), indent=2)
@@ -232,7 +239,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(f"{GATEWAY_URL}/chat", json=payload)
+            resp = await client.post(f"{GATEWAY_URL}/chat", json=payload, headers=_auth_headers())
             resp.raise_for_status()
             resp_data = resp.json()
     except Exception as exc:

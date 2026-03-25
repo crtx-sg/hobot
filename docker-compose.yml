@@ -39,6 +39,9 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - API_KEYS=${API_KEYS:-}
+      - ORTHANC_USER=${ORTHANC_USER:-orthanc}
+      - ORTHANC_PASS=${ORTHANC_PASS:-orthanc}
 
   # --- Telegram Bot ---
   telegram-bot:
@@ -48,13 +51,39 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - GATEWAY_URL=http://clinibot-gateway:3000
       - TENANT_ID=default
+      - API_KEY=${TG_BOT_API_KEY:-}
     restart: unless-stopped
 
-  # --- Model ---
+  # --- Models ---
   ollama:
     image: ollama/ollama
     volumes:
       - ollama-models:/root/.ollama
+    ports:
+      - "11435:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # MedGemma vision model via vLLM (OpenAI-compatible API)
+  # Gated model: accept terms at https://huggingface.co/google/medgemma-4b-it
+  # then set HF_TOKEN in .env
+  vllm-medgemma:
+    image: vllm/vllm-openai:latest
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    command: >
+      --model google/medgemma-4b-it
+      --dtype auto
+      --max-model-len 4096
+      --trust-remote-code
+      --port 8000
     deploy:
       resources:
         reservations:
@@ -141,16 +170,16 @@ services:
   synthetic-patient-services:
     build: ./synthetic-patient-services
 
-  # --- Audit DB Web UI ---
+  # --- Audit DB Web UI (no external port — internal only; expose via docker-compose.override.yml for dev) ---
   audit-db:
     image: coleifer/sqlite-web
     volumes:
       - audit-data:/data
-    ports: ["8081:8080"]
     command: sqlite_web -H 0.0.0.0 /data/clinic.db
 
 volumes:
   ollama-models:
+  vllm-models:
   audit-data:
   sessions-data:
   hdf5-data:

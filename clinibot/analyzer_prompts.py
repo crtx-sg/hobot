@@ -2,62 +2,44 @@
 
 ANALYZER_PROMPTS = {
     # Intercept (self-contained, no context)
-    "radiology_report_summary": """Summarize this radiology report. Highlight key findings, impressions, and recommendations. Be concise.
+    "radiology_report_summary": """Summarize the following radiology report. Highlight key findings, impressions, and any recommendations for follow-up.
 
 Report:
 {data}""",
 
     # Tool analyzers (context-dependent, capability-agnostic)
-    "lab_analysis": """You are a clinical pathologist reviewing lab results.
+    "lab_analysis": """Review the following lab results as a clinical pathologist and write a clinical interpretation.
 
-Patient: {context}
+Patient context: {context}
 
 Lab results:
 {data}
 
-Instructions:
-- Flag values outside reference ranges
-- Note critical values requiring immediate attention
-- Interpret in context of patient's conditions and medications
-- For each abnormal finding, note if expected (known condition) or new
-- Be concise.""",
+In your interpretation, cover each result with its reference range and whether normal or abnormal, any critical values requiring immediate attention, and clinical correlation interpreting abnormal findings in context of patient conditions and medications.""",
 
-    "ecg_analysis": """You are a cardiologist interpreting ECG data.
+    "ecg_analysis": """Interpret the following ECG data as a cardiologist and write a clinical assessment.
 
-Patient: {context}
+Patient context: {context}
 
 ECG data:
 {data}
 
-Instructions:
-- Interpret all available ECG findings
-- Correlate with patient's conditions and medications
-- Note any acute or concerning changes
-- Be concise.""",
+In your assessment, cover rhythm, rate, axis, and any abnormalities, clinical correlation with patient conditions and medications, and recommended follow-up actions.""",
 
-    "vitals_analysis": """You are a critical care specialist reviewing vital signs.
+    "vitals_analysis": """Patient: {context}
 
-Patient: {context}
+Vital signs: {data}
 
-Vitals data:
-{data}
+Hospital thresholds ({scoring} scoring):
+{thresholds}
 
-Instructions:
-- Assess each vital against normal ranges AND patient-specific targets
-- Evaluate NEWS2 / EWS score if available
-- Note trends if history available
-- Flag values needing immediate attention
-- Consider medication effects (beta-blockers on HR, antihypertensives on BP)
-- Be concise.""",
+Provide a detailed clinical assessment in plain text. Assess each vital sign against the hospital thresholds above, flag any values outside normal or critical ranges, consider medication effects such as beta-blockers on heart rate and antihypertensives on blood pressure, and provide 2-4 specific recommendations.
 
-    "radiology_image_analysis": """You are a radiologist interpreting a medical image.
+Clinical Assessment:""",
 
-Patient: {context}
+    "radiology_image_analysis": """Interpret the following medical image as a radiologist. The patient context is provided below.
 
-Instructions:
-- Describe findings systematically
-- Note pathology, alignment, foreign bodies, air/fluid levels
-- Consider patient history when interpreting (known conditions vs new findings)
-- Recommend follow-up imaging if appropriate
-- Be concise.""",
+Patient context: {context}
+
+Describe findings systematically including pathology, alignment, foreign bodies, and air/fluid levels. Consider patient history when interpreting (known conditions vs new findings). Recommend follow-up imaging if appropriate.""",
 }

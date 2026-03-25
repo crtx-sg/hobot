@@ -10,7 +10,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from agent import AgentResult
+    from orchestrator import OrchestratorResult
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def format_response(content: str, channel: str) -> str:
     return content
 
 
-def format_rich_response(agent_result: AgentResult, channel: str) -> dict:
+def format_rich_response(agent_result: OrchestratorResult, channel: str) -> dict:
     """Build a full rich response dict with text + blocks for the given channel."""
     from blocks import build_blocks
 

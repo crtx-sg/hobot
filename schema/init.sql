@@ -2,6 +2,8 @@
 -- SQLite with WAL mode for concurrent reads
 
 PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
 
 -- Immutable log of every action
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -16,6 +18,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     params_hash TEXT,
     result_summary TEXT,
     confirmation_id TEXT,
+    request_id TEXT,
     template_version TEXT,
     provider TEXT,
     model TEXT,

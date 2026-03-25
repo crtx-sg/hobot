@@ -6,6 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py .
+COPY skills/ ./skills/
+COPY domain_models/ ./domain_models/
 
 EXPOSE 3000
 

@@ -1,13 +1,19 @@
 """Session manager — JSONL-backed conversation state with in-memory cache."""
 
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import phi as _phi
+
+logger = logging.getLogger("clinibot.session")
+
 SESSIONS_DIR = os.environ.get("SESSIONS_DIR", "/data/sessions")
+SESSION_TTL_HOURS = int(os.environ.get("SESSION_TTL_HOURS", "24"))
 
 
 @dataclass
@@ -19,6 +25,7 @@ class Session:
     messages: list[dict] = field(default_factory=list)
     active_patients: set[str] = field(default_factory=set)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_activity: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     last_consolidated: int = 0
     summary: str = ""
 
@@ -46,6 +53,7 @@ class Session:
             "user_id": self.user_id,
             "channel": self.channel,
             "created_at": self.created_at,
+            "last_activity": self.last_activity,
             "last_consolidated": self.last_consolidated,
             "summary": self.summary,
             "active_patients": list(self.active_patients),
@@ -62,6 +70,7 @@ class Session:
             "user_id": self.user_id,
             "channel": self.channel,
             "created_at": self.created_at,
+            "last_activity": self.last_activity,
             "last_consolidated": 0,
             "summary": "",
             "active_patients": [],
@@ -69,13 +78,17 @@ class Session:
         self._append_line(meta)
 
     def append_message(self, role: str, content: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.last_activity = now
         msg = {
             "role": role,
             "content": content,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now,
         }
         self.messages.append(msg)
-        self._append_line({"type": "message", **msg})
+        # Redact PHI before writing to disk (one-way; in-memory keeps original)
+        redacted_content, _ = _phi.redact(content)
+        self._append_line({"type": "message", "role": role, "content": redacted_content, "timestamp": now})
 
     def get_context(self, max_messages: int = 20) -> list[dict]:
         """Return recent messages, prepending consolidated summary if available."""
@@ -113,6 +126,7 @@ def _load_from_jsonl(path: Path) -> Session | None:
         user_id=meta["user_id"],
         channel=meta["channel"],
         created_at=meta.get("created_at", ""),
+        last_activity=meta.get("last_activity", meta.get("created_at", "")),
         last_consolidated=meta.get("last_consolidated", 0),
         summary=meta.get("summary", ""),
         active_patients=set(meta.get("active_patients", [])),
@@ -135,6 +149,16 @@ def _load_from_jsonl(path: Path) -> Session | None:
 _sessions: dict[str, Session] = {}
 
 
+def _is_expired(sess: Session) -> bool:
+    """Check if session has exceeded TTL."""
+    try:
+        last = datetime.fromisoformat(sess.last_activity)
+        age_hours = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+        return age_hours > SESSION_TTL_HOURS
+    except (ValueError, TypeError):
+        return False
+
+
 def get_or_create(
     session_id: str | None,
     tenant_id: str,
@@ -143,13 +167,18 @@ def get_or_create(
 ) -> Session:
     """Return existing session (memory or disk) or create a new one."""
     if session_id and session_id in _sessions:
-        return _sessions[session_id]
+        sess = _sessions[session_id]
+        # User binding: mismatch → new session (legitimate new user on same channel)
+        if sess.user_id != user_id or _is_expired(sess):
+            del _sessions[session_id]
+        else:
+            return sess
 
     # Try loading from disk
     if session_id:
         path = Path(SESSIONS_DIR) / tenant_id / f"{session_id}.jsonl"
         sess = _load_from_jsonl(path)
-        if sess:
+        if sess and sess.user_id == user_id and not _is_expired(sess):
             _sessions[session_id] = sess
             return sess
 
@@ -162,3 +191,35 @@ def get_or_create(
 
 def get(session_id: str) -> Session | None:
     return _sessions.get(session_id)
+
+
+MAX_SESSION_FILE_BYTES = int(os.environ.get("MAX_SESSION_FILE_BYTES", str(5 * 1024 * 1024)))  # 5 MB
+
+
+def evict_stale() -> int:
+    """Remove expired sessions from in-memory cache and clean up oversized JSONL files. Returns count evicted."""
+    expired = [sid for sid, sess in _sessions.items() if _is_expired(sess)]
+    for sid in expired:
+        del _sessions[sid]
+    if expired:
+        logger.info("Evicted %d stale sessions", len(expired))
+
+    # Clean up oversized session files on disk
+    sessions_path = Path(SESSIONS_DIR)
+    if sessions_path.exists():
+        try:
+            for jsonl in sessions_path.rglob("*.jsonl"):
+                try:
+                    if jsonl.stat().st_size > MAX_SESSION_FILE_BYTES:
+                        logger.warning("Session file %s exceeds %d bytes, truncating", jsonl, MAX_SESSION_FILE_BYTES)
+                        lines = jsonl.read_text().splitlines()
+                        if len(lines) > 1:
+                            # Keep metadata (line 0) + last 50 messages
+                            kept = [lines[0]] + lines[-50:]
+                            jsonl.write_text("\n".join(kept) + "\n")
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    return len(expired)

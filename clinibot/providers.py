@@ -128,20 +128,36 @@ class LLMProvider(ABC):
 
 class OllamaProvider(LLMProvider):
     async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult | None:
-        # Ollama: ignore tools param, text-based tool parsing in agent loop
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-                resp = await _request_with_retry(
-                    client, "POST",
-                    f"{self.config.base_url}/api/chat",
-                    json={
-                        "model": self.config.model,
-                        "messages": messages,
-                        "stream": False,
-                    },
-                    provider_name="ollama",
-                )
-                content = resp.json().get("message", {}).get("content", "")
+                # Single user message with no tools → use /api/generate
+                # (better results with base/completion models like OpenBioLLM)
+                if len(messages) == 1 and messages[0]["role"] == "user" and not tools:
+                    resp = await _request_with_retry(
+                        client, "POST",
+                        f"{self.config.base_url}/api/generate",
+                        json={
+                            "model": self.config.model,
+                            "prompt": messages[0]["content"],
+                            "stream": False,
+                            "options": {"num_predict": 2048},
+                        },
+                        provider_name="ollama",
+                    )
+                    content = resp.json().get("response", "")
+                else:
+                    resp = await _request_with_retry(
+                        client, "POST",
+                        f"{self.config.base_url}/api/chat",
+                        json={
+                            "model": self.config.model,
+                            "messages": messages,
+                            "stream": False,
+                            "options": {"num_predict": 2048},
+                        },
+                        provider_name="ollama",
+                    )
+                    content = resp.json().get("message", {}).get("content", "")
                 return ChatResult(content=content)
         except Exception as exc:
             logger.warning("Ollama chat failed: %s", exc)
@@ -465,14 +481,17 @@ def _resolve_env(value: str) -> str:
     return re.sub(r"\$\{(\w+)\}", replacer, value)
 
 
-def load_providers(config_path: str) -> None:
-    """Load providers from config.json."""
+def load_providers(config_path: str, config_override: dict | None = None) -> None:
+    """Load providers from config.json, or from config_override if provided."""
     global _default_provider
-    if not os.path.exists(config_path):
+    if config_override:
+        data = config_override
+    elif os.path.exists(config_path):
+        with open(config_path) as f:
+            data = json.load(f)
+    else:
         logger.warning("Provider config not found: %s", config_path)
         return
-    with open(config_path) as f:
-        data = json.load(f)
 
     agent_defaults = data.get("agents", {}).get("defaults", {})
     default_model = agent_defaults.get("model", "")
@@ -495,12 +514,14 @@ def load_providers(config_path: str) -> None:
             timeout=timeout,
             supports_vision=supports_vision,
         )
-        # Route to correct provider class based on name/URL
-        if "ollama" in name.lower() or "/api/" in base_url:
+        # Route to correct provider class
+        # Explicit "type" field takes precedence; otherwise infer from name/URL
+        ptype = pconf.get("type", "").lower()
+        if ptype == "ollama" or (not ptype and ("ollama" in name.lower() or "/api/" in base_url)):
             _providers[name] = OllamaProvider(config)
-        elif "gemini" in name.lower() or "generativelanguage.googleapis.com" in base_url:
+        elif ptype == "gemini" or (not ptype and ("gemini" in name.lower() or "generativelanguage.googleapis.com" in base_url)):
             _providers[name] = GeminiProvider(config)
-        elif "anthropic" in name.lower() or "api.anthropic.com" in base_url:
+        elif ptype == "anthropic" or (not ptype and ("anthropic" in name.lower() or "api.anthropic.com" in base_url)):
             _providers[name] = AnthropicProvider(config)
         else:
             _providers[name] = OpenAICompatibleProvider(config)

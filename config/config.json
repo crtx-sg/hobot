@@ -1,4 +1,48 @@
 {
+  "tool_domains": {
+    "core":        ["list_wards", "get_ward_rounds", "get_patient"],
+    "vitals":      ["get_vitals", "get_vitals_history", "get_vitals_trend", "get_patient_thresholds", "analyze_vitals", "get_active_alarms", "clear_alarm", "update_patient_thresholds"],
+    "labs":        ["get_lab_results", "analyze_lab_results"],
+    "medications": ["get_medications", "get_allergies", "get_conditions", "dispense_medication", "check_drug_interactions"],
+    "ecg":         ["get_latest_ecg", "get_event_ecg", "analyze_ecg"],
+    "radiology":   ["get_latest_study", "get_report", "get_studies", "analyze_radiology_image"],
+    "orders":      ["write_order", "get_orders", "order_lab", "get_lab_order", "get_order_status", "order_blood_crossmatch", "get_crossmatch_status", "get_blood_availability", "order_diet", "get_care_plan"],
+    "emergency":   ["initiate_code_blue", "request_ambulance", "escalate"],
+    "services":    ["request_housekeeping", "get_request_status"],
+    "scheduling":  ["schedule_appointment", "set_reminder"],
+    "supplies":    ["get_inventory", "get_equipment_status", "place_supply_order"],
+    "ward":        ["resolve_bed", "resolve_doctor", "list_doctors", "get_ward_patients", "get_doctor_patients", "get_patient_events", "get_event_vitals", "get_ward_risk_ranking"]
+  },
+  "clinical_memory": {
+    "ttl_hours": {
+      "vitals": 4, "vitals_trend": 4, "medication": 24, "allergy": 168,
+      "demographics": 168, "lab_result": 12, "ecg": 8,
+      "vitals_thresholds": 168, "alarm": 1, "condition": 168,
+      "imaging_study": 168, "radiology_report": 168,
+      "lab_interpretation": 12, "ecg_interpretation": 8,
+      "vitals_interpretation": 4, "radiology_interpretation": 168
+    },
+    "cleanup_interval_minutes": 30
+  },
+  "classifier": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "timeout": 2,
+    "fallback_domains": ["core", "vitals", "labs", "medications", "ward", "emergency"],
+    "domain_keywords": {
+      "vitals": ["vitals?", "bp", "blood\\s*pressure", "heart\\s*rate", "spo2", "temp(?:erature)?", "news2?", "pulse"],
+      "labs": ["labs?", "cbc", "bmp", "blood\\s*test", "culture", "hba1c", "wbc", "hemoglobin", "creatinine"],
+      "ecg": ["ecg", "ekg", "rhythm", "12.lead"],
+      "radiology": ["x.?ray", "ct\\b", "mri", "scan", "radiol", "chest", "imaging", "stud(?:y|ies)"],
+      "medications": ["medicat", "drug", "prescri", "dispens", "allerg", "interaction"],
+      "orders": ["order(?!ly)", "prescribe", "diet", "meal", "blood\\s*bank", "crossmatch", "transfus"],
+      "emergency": ["code\\s*blue", "emergency", "ambulance", "crash", "arrest", "escalat"],
+      "services": ["housekeep\\w*", "maintenance", "porter", "clean(?:ing)?"],
+      "scheduling": ["appoint", "remind", "schedul"],
+      "supplies": ["inventory", "suppl(?:y|ies)", "stock", "equipment"],
+      "ward": ["ward", "doctor", "rounds?", "patient\\s*list"]
+    }
+  },
   "providers": {
     "gemini": {
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -12,6 +56,20 @@
       "baseUrl": "http://ollama:11434",
       "model": "glm-5:cloud",
       "phi_safe": true
+    },
+    "openbiollm": {
+      "type": "ollama",
+      "baseUrl": "http://ollama:11434",
+      "model": "koesn/llama3-openbiollm-8b",
+      "phi_safe": true,
+      "timeout": 60.0
+    },
+    "medgemma": {
+      "type": "ollama",
+      "baseUrl": "http://ollama:11434",
+      "model": "hf.co/SandLogicTechnologies/MedGemma-4B-IT-GGUF:Q4_K_M",
+      "phi_safe": true,
+      "timeout": 60.0
     },
     "anthropic": {
       "baseUrl": "https://api.anthropic.com",
@@ -27,49 +85,80 @@
       "provider": "anthropic"
     }
   },
-  "analyzers": {
-    "intercept": {
-      "get_report": {
-        "provider": "gemini",
-        "prompt_template": "radiology_report_summary",
-        "domain": "radiology",
-        "input_type": "structured"
+  "rate_limits": {
+    "per_user": {"requests": 30, "window_seconds": 60},
+    "per_tenant": {"requests": 200, "window_seconds": 60}
+  },
+  "skills": {
+    "interpret_vitals": {
+      "provider": "gemini",
+      "timeout": 30,
+      "enabled": true,
+      "scoring": "news2",
+      "thresholds": {
+        "heart_rate":       {"low": 60, "high": 100, "critical_low": 40, "critical_high": 150},
+        "bp_systolic":      {"low": 90, "high": 140, "critical_low": 70, "critical_high": 220},
+        "bp_diastolic":     {"low": 60, "high": 90,  "critical_low": 40, "critical_high": 120},
+        "spo2":             {"low": 94, "critical_low": 90},
+        "temperature":      {"low": 36.1, "high": 38.0, "critical_low": 35.0, "critical_high": 39.5},
+        "respiration_rate": {"low": 12, "high": 20, "critical_low": 8, "critical_high": 30}
       }
     },
-    "tools": {
-      "analyze_lab_results": {
-        "provider": "gemini",
-        "prompt_template": "lab_analysis",
-        "domain": "pathology",
-        "source_fact_types": ["lab_result"],
-        "context_types": ["demographics", "medication", "allergy"]
-      },
-      "analyze_ecg": {
-        "provider": "ollama",
-        "prompt_template": "ecg_analysis",
-        "domain": "cardiology",
-        "preprocessor": "ecg_stub",
-        "source_fact_types": ["ecg"],
-        "context_types": ["demographics", "medication"]
-      },
-      "analyze_vitals": {
-        "provider": "gemini",
-        "prompt_template": "vitals_analysis",
-        "domain": "critical_care",
-        "source_fact_types": ["vitals", "vitals_trend"],
-        "context_types": ["demographics", "medication", "allergy"]
-      },
-      "analyze_radiology_image": {
-        "provider": "gemini",
-        "prompt_template": "radiology_image_analysis",
-        "domain": "radiology",
-        "input_type": "image_wado",
-        "context_types": ["demographics", "medication", "imaging_study"]
-      }
+    "interpret_labs": {
+      "provider": "gemini",
+      "timeout": 30,
+      "enabled": true
     },
-    "defaults": {
-      "fallback": "passthrough",
-      "timeout": 15
+    "interpret_radiology": {
+      "provider": "gemini",
+      "timeout": 30,
+      "enabled": true
+    },
+    "interpret_ecg": {
+      "provider": "ollama",
+      "timeout": 30,
+      "enabled": true
+    },
+    "analyze_radiology_image": {
+      "provider": "gemini",
+      "timeout": 20,
+      "enabled": true
+    },
+    "medication_validation": {
+      "timeout": 10,
+      "enabled": true
+    },
+    "blood_availability": {
+      "timeout": 5,
+      "enabled": true
+    },
+    "service_orchestration": {
+      "timeout": 5,
+      "enabled": true
+    },
+    "clinical_context": {
+      "timeout": 10,
+      "enabled": true
+    },
+    "clinical_summary": {
+      "provider": "gemini",
+      "timeout": 20,
+      "enabled": true
+    },
+    "risk_scoring": {
+      "timeout": 5,
+      "enabled": true
+    },
+    "care_plan_summary": {
+      "provider": "medgemma",
+      "timeout": 20,
+      "enabled": true
+    },
+    "clinical_reasoning": {
+      "provider": "medgemma"
+    },
+    "radiology_model": {
+      "provider": "medgemma"
     }
   }
 }

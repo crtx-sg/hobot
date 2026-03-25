@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+from db_utils import retry_execute
+
 AUDIT_DB = os.environ.get("AUDIT_DB", "/data/audit/clinic.db")
 SCHEMA_PATH = os.environ.get("SCHEMA_PATH", "/app/schema/init.sql")
 
@@ -48,6 +50,7 @@ async def log_action(
     params: dict | None = None,
     result_summary: str | None = None,
     confirmation_id: str | None = None,
+    request_id: str | None = None,
     provider: str | None = None,
     model: str | None = None,
     latency_ms: int | None = None,
@@ -56,19 +59,19 @@ async def log_action(
     assert _db is not None, "audit db not initialized"
     now = datetime.now(timezone.utc).isoformat()
     params_hash = _hash_params(params) if params else None
-    cur = await _db.execute(
+    cur = await retry_execute(
+        _db,
         """INSERT INTO audit_log
            (tenant_id, timestamp, session_id, user_id, channel, action,
             tool_name, params_hash, result_summary, confirmation_id,
-            provider, model, latency_ms)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            request_id, provider, model, latency_ms)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             tenant_id, now, session_id, user_id, channel, action,
             tool_name, params_hash, result_summary, confirmation_id,
-            provider, model, latency_ms,
+            request_id, provider, model, latency_ms,
         ),
     )
-    await _db.commit()
     return cur.lastrowid
 
 
@@ -80,12 +83,12 @@ async def log_escalation(
 ) -> int:
     """Insert an escalation record. Returns the escalation id."""
     assert _db is not None, "audit db not initialized"
-    cur = await _db.execute(
+    cur = await retry_execute(
+        _db,
         """INSERT INTO escalations (tenant_id, audit_log_id, escalated_to, reason)
            VALUES (?,?,?,?)""",
         (tenant_id, audit_log_id, escalated_to, reason),
     )
-    await _db.commit()
     return cur.lastrowid
 
 
@@ -97,9 +100,9 @@ async def resolve_escalation(
     """Mark an escalation as resolved."""
     assert _db is not None, "audit db not initialized"
     now = datetime.now(timezone.utc).isoformat()
-    await _db.execute(
+    await retry_execute(
+        _db,
         """UPDATE escalations SET resolved_at=?, resolved_by=?, resolution=?
            WHERE id=?""",
         (now, resolved_by, resolution, escalation_id),
     )
-    await _db.commit()

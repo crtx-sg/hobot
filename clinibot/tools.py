@@ -1,12 +1,15 @@
 """Tool registry, MCP backend dispatch, and critical-tool confirmation gate."""
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import time
 import uuid
-from datetime import datetime, timedelta, timezone
+
 from typing import Any
 
 import httpx
@@ -24,15 +27,92 @@ EHR_BASE = os.environ.get("EHR_BASE", "http://synthetic-ehr:8080")
 LIS_BASE = os.environ.get("LIS_BASE", "http://synthetic-lis:8000")
 PHARMACY_BASE = os.environ.get("PHARMACY_BASE", "http://synthetic-pharmacy:8000")
 RADIOLOGY_BASE = os.environ.get("RADIOLOGY_BASE", "http://synthetic-radiology:8042")
+
+# Orthanc credentials from env (never hardcode)
+ORTHANC_USER = os.environ.get("ORTHANC_USER", "orthanc")
+ORTHANC_PASS = os.environ.get("ORTHANC_PASS", "orthanc")
+
+def _orthanc_auth() -> tuple[str, str]:
+    return (ORTHANC_USER, ORTHANC_PASS)
 BLOODBANK_BASE = os.environ.get("BLOODBANK_BASE", "http://synthetic-bloodbank:8000")
 ERP_BASE = os.environ.get("ERP_BASE", "http://synthetic-erp:8000")
 PATIENT_SERVICES_BASE = os.environ.get("PATIENT_SERVICES_BASE", "http://synthetic-patient-services:8000")
+
+# ---------------------------------------------------------------------------
+# Shared httpx.AsyncClient (created/closed via lifespan)
+# ---------------------------------------------------------------------------
+
+_http_client: httpx.AsyncClient | None = None
+
+
+def init_http_client() -> None:
+    global _http_client
+    _http_client = httpx.AsyncClient(timeout=15.0)
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client:
+        await _http_client.aclose()
+        _http_client = None
+
+
+# ---------------------------------------------------------------------------
+# Confirmation HMAC signing (in-memory secret, regenerated each startup)
+# ---------------------------------------------------------------------------
+
+_CONFIRM_SECRET: bytes = os.urandom(32)
+
+CONFIRMATION_TTL_SECONDS = int(os.environ.get("CONFIRMATION_TTL_SECONDS", "300"))  # 5 min
 
 # ---------------------------------------------------------------------------
 # Tool registry — loaded from config/tools.json
 # ---------------------------------------------------------------------------
 
 _TOOLS_CONFIG: dict[str, dict] = {}
+
+# ---------------------------------------------------------------------------
+# Tool domain groups — loaded from config.json
+# ---------------------------------------------------------------------------
+
+_domain_config: dict[str, list[str]] = {}
+
+
+def load_domain_config(config_path: str) -> None:
+    """Load tool_domains from config.json, warn about orphan tools."""
+    global _domain_config
+    if not os.path.exists(config_path):
+        return
+    with open(config_path) as f:
+        data = json.load(f)
+    _domain_config = data.get("tool_domains", {})
+    if not _domain_config:
+        return
+
+    # Validate: warn about tools not in any domain
+    assigned = set()
+    for tools_list in _domain_config.values():
+        assigned.update(tools_list)
+
+    all_tools = set(TOOL_BACKENDS.keys()) | {"escalate"} | set(_GATEWAY_TOOLS.keys())
+    orphans = all_tools - assigned
+    if orphans:
+        logger.warning("Orphan tools (not in any domain): %s", sorted(orphans))
+
+    logger.info("Loaded %d tool domains (%d tools assigned)", len(_domain_config), len(assigned))
+
+
+def get_tools_for_domains(domains: list[str]) -> list[str]:
+    """Return union of tool names for given domains. Always includes 'core'."""
+    if not _domain_config:
+        return []  # No domains configured, caller should use all tools
+    result: set[str] = set()
+    # Always include core
+    if "core" not in domains:
+        domains = ["core"] + list(domains)
+    for domain in domains:
+        result.update(_domain_config.get(domain, []))
+    return list(result)
 
 
 def load_tools_config(path: str = "/app/config/tools.json") -> None:
@@ -85,6 +165,7 @@ TOOL_BACKENDS: dict[str, tuple[str, str, str]] = {
     "get_vitals": (MONITORING_BASE, "GET", "/vitals/{patient_id}"),
     "get_vitals_history": (MONITORING_BASE, "GET", "/vitals/{patient_id}/history"),
     "get_vitals_trend": (MONITORING_BASE, "GET", "/vitals/{patient_id}/trend"),
+    "get_patient_thresholds": (MONITORING_BASE, "GET", "/thresholds/{patient_id}"),
     "list_wards": (MONITORING_BASE, "GET", "/wards"),
     "list_doctors": (MONITORING_BASE, "GET", "/doctors"),
     "get_ward_patients": (MONITORING_BASE, "GET", "/ward/{ward_id}/patients"),
@@ -93,6 +174,9 @@ TOOL_BACKENDS: dict[str, tuple[str, str, str]] = {
     "get_event_vitals": (MONITORING_BASE, "GET", "/events/{patient_id}/{event_id}/vitals"),
     "get_event_ecg": (MONITORING_BASE, "GET", "/events/{patient_id}/{event_id}/ecg"),
     "initiate_code_blue": (MONITORING_BASE, "POST", "/code-blue"),
+    "get_active_alarms": (MONITORING_BASE, "GET", "/alarms/{patient_id}"),
+    "clear_alarm": (MONITORING_BASE, "POST", "/alarms/{alarm_id}/clear"),
+    "update_patient_thresholds": (MONITORING_BASE, "PUT", "/thresholds/{patient_id}"),
     # EHR
     "get_patient": (EHR_BASE, "GET", "/fhir/Patient?identifier={patient_id}"),
     "get_medications": (EHR_BASE, "GET", "/fhir/MedicationRequest?patient={patient_id}"),
@@ -110,6 +194,8 @@ TOOL_BACKENDS: dict[str, tuple[str, str, str]] = {
     "get_order_status": (LIS_BASE, "GET", "/lab/{order_id}"),
     # Monitoring — ECG
     "get_latest_ecg": (MONITORING_BASE, "GET", "/ecg/{patient_id}/latest"),
+    # Monitoring — Conditions
+    "get_conditions": (MONITORING_BASE, "GET", "/conditions/{patient_id}"),
     # Pharmacy
     "check_drug_interactions": (PHARMACY_BASE, "POST", "/interactions"),
     "dispense_medication": (PHARMACY_BASE, "POST", "/dispense"),
@@ -126,15 +212,14 @@ TOOL_BACKENDS: dict[str, tuple[str, str, str]] = {
     "order_diet": (PATIENT_SERVICES_BASE, "POST", "/diet-order"),
     "request_ambulance": (PATIENT_SERVICES_BASE, "POST", "/transport"),
     "get_request_status": (PATIENT_SERVICES_BASE, "GET", "/request/{request_id}"),
+    # Bed resolution (normalization handled by monitoring backend)
+    "resolve_bed": (MONITORING_BASE, "GET", "/bed/{bed_id}/patient"),
+    # Doctor resolution (fuzzy name match)
+    "resolve_doctor": (MONITORING_BASE, "GET", "/doctor/resolve"),
+    # Scheduling & reminders
+    "schedule_appointment": (PATIENT_SERVICES_BASE, "POST", "/appointment"),
+    "set_reminder": (PATIENT_SERVICES_BASE, "POST", "/reminder"),
 }
-
-# ---------------------------------------------------------------------------
-# In-memory stores for scheduling & reminders
-# ---------------------------------------------------------------------------
-
-_appointments: dict[str, dict] = {}
-_reminders: dict[str, dict] = {}
-
 
 # ---------------------------------------------------------------------------
 # Gateway-level tools (handled locally, not dispatched to backends)
@@ -143,31 +228,33 @@ _reminders: dict[str, dict] = {}
 async def _get_ward_rounds(params: dict, session: Any) -> dict:
     """Fetch ward rounds from monitoring, fan-out for meds + latest scan per patient."""
     ward_id = params.get("ward_id", "")
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    client = _http_client or httpx.AsyncClient(timeout=15.0)
+    try:
         resp = await client.get(f"{MONITORING_BASE}/ward/{ward_id}/rounds")
         if resp.status_code != 200:
             return {"error": f"Monitoring returned {resp.status_code}", "detail": resp.text[:500]}
         data = resp.json()
+    finally:
+        if not _http_client:
+            await client.aclose()
 
     patients = data.get("patients", [])
 
-    async def _enrich_patient(p: dict, client: httpx.AsyncClient) -> None:
+    async def _enrich_patient(p: dict, c: httpx.AsyncClient) -> None:
         pid = p.get("patient_id", "")
-        meds_coro = client.get(f"{EHR_BASE}/fhir/MedicationRequest?patient={pid}")
-        scan_coro = client.get(
+        meds_coro = c.get(f"{EHR_BASE}/fhir/MedicationRequest?patient={pid}")
+        scan_coro = c.get(
             f"{RADIOLOGY_BASE}/dicom-web/studies?PatientID={pid}&limit=1",
-            auth=("orthanc", "orthanc"),
+            auth=_orthanc_auth(),
         )
         results = await asyncio.gather(meds_coro, scan_coro, return_exceptions=True)
 
-        # Medications
         meds_result = results[0]
         if isinstance(meds_result, Exception) or meds_result.status_code != 200:
             p["medications"] = []
         else:
             p["medications"] = meds_result.json().get("medications", [])
 
-        # Latest scan
         scan_result = results[1]
         if isinstance(scan_result, Exception) or scan_result.status_code != 200:
             p["latest_scan"] = None
@@ -175,67 +262,145 @@ async def _get_ward_rounds(params: dict, session: Any) -> dict:
             studies = scan_result.json().get("studies", [])
             p["latest_scan"] = studies[0] if studies else None
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        await asyncio.gather(*[_enrich_patient(p, client) for p in patients])
+    enrich_client = _http_client or httpx.AsyncClient(timeout=15.0)
+    try:
+        await asyncio.gather(*[_enrich_patient(p, enrich_client) for p in patients])
+    finally:
+        if not _http_client:
+            await enrich_client.aclose()
 
     return data
 
 
-async def _resolve_bed(params: dict, session: Any) -> dict:
-    """Resolve bed ID to patient ID via monitoring service."""
-    bed_id = params.get("bed_id", "").strip().upper()
-    # Normalize: "2" → "BED2", "bed2" → "BED2"
-    if bed_id and not bed_id.startswith("BED"):
-        bed_id = f"BED{bed_id}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{MONITORING_BASE}/bed/{bed_id}/patient")
-        if resp.status_code != 200:
-            return {"error": f"Bed {bed_id} not found"}
-        return resp.json()
+async def _request_additional_tools(params: dict, session: Any) -> dict:
+    """Request tools from additional domains when current tools are insufficient."""
+    domains = params.get("domains", [])
+    valid = [d for d in domains if d in _domain_config]
+    return {"status": "tools_expanded", "added_domains": valid}
 
 
-async def _schedule_appointment(params: dict, session: Any) -> dict:
-    """Schedule an appointment (in-memory)."""
-    appt_id = f"APPT-{uuid.uuid4().hex[:8].upper()}"
-    appt = {
-        "appointment_id": appt_id,
-        "patient_id": params.get("patient_id", ""),
-        "doctor": params.get("doctor", ""),
-        "datetime": params.get("datetime", ""),
-        "notes": params.get("notes", ""),
-        "status": "scheduled",
-    }
-    _appointments[appt_id] = appt
-    return appt
+async def _get_care_plan(params: dict, session: Any) -> dict:
+    """Fan-out: aggregate orders, appointments, reminders, pending labs for a patient."""
+    patient_id = params.get("patient_id", "")
+    if not patient_id:
+        return {"error": "patient_id is required"}
 
+    client = _http_client or httpx.AsyncClient(timeout=15.0)
+    try:
+        orders_url, _ = _build_url(EHR_BASE, "/fhir/ServiceRequest?patient={patient_id}", {"patient_id": patient_id})
+        labs_url, _ = _build_url(LIS_BASE, "/labs/{patient_id}", {"patient_id": patient_id})
 
-async def _set_reminder(params: dict, session: Any) -> dict:
-    """Set a reminder (in-memory). Fires after delay_minutes via background loop."""
-    rem_id = f"REM-{uuid.uuid4().hex[:8].upper()}"
-    delay = params.get("delay_minutes", 60)
-    trigger_at = datetime.now(timezone.utc) + timedelta(minutes=delay)
-    reminder = {
-        "reminder_id": rem_id,
-        "session_id": session.id,
-        "channel": session.channel,
-        "message": params.get("message", ""),
-        "trigger_at": trigger_at.isoformat(),
-        "status": "pending",
-    }
-    _reminders[rem_id] = reminder
+        orders_coro = client.get(orders_url)
+        appts_coro = client.get(
+            f"{PATIENT_SERVICES_BASE}/appointments", params={"patient_id": patient_id},
+        )
+        reminders_coro = client.get(
+            f"{PATIENT_SERVICES_BASE}/reminders", params={"patient_id": patient_id},
+        )
+        labs_coro = client.get(labs_url)
+
+        results = await asyncio.gather(
+            orders_coro, appts_coro, reminders_coro, labs_coro,
+            return_exceptions=True,
+        )
+
+        # Orders
+        orders_result = results[0]
+        if isinstance(orders_result, Exception) or orders_result.status_code != 200:
+            orders = []
+        else:
+            orders = orders_result.json().get("orders", orders_result.json().get("entry", []))
+
+        # Appointments
+        appts_result = results[1]
+        if isinstance(appts_result, Exception) or appts_result.status_code != 200:
+            appointments = []
+        else:
+            appointments = appts_result.json().get("appointments", [])
+
+        # Reminders
+        rem_result = results[2]
+        if isinstance(rem_result, Exception) or rem_result.status_code != 200:
+            reminders = []
+        else:
+            reminders = rem_result.json().get("reminders", [])
+
+        # Pending labs
+        labs_result = results[3]
+        if isinstance(labs_result, Exception) or labs_result.status_code != 200:
+            pending_labs = []
+        else:
+            all_labs = labs_result.json().get("labs", labs_result.json().get("results", []))
+            pending_labs = [l for l in all_labs if l.get("status", "").lower() in ("pending", "in_progress", "ordered")]
+
+    finally:
+        if not _http_client:
+            await client.aclose()
+
     return {
-        "reminder_id": rem_id,
-        "trigger_at": trigger_at.isoformat(),
-        "message": reminder["message"],
-        "status": "scheduled",
+        "patient_id": patient_id,
+        "orders": orders,
+        "appointments": appointments,
+        "reminders": reminders,
+        "pending_labs": pending_labs,
     }
+
+
+async def _get_ward_risk_ranking(params: dict, session: Any) -> dict:
+    """Fan-out: fetch ward patients with vitals/NEWS and rank by risk."""
+    ward_id = params.get("ward_id", "")
+    if not ward_id:
+        return {"error": "ward_id is required"}
+
+    client = _http_client or httpx.AsyncClient(timeout=15.0)
+    try:
+        resp = await client.get(f"{MONITORING_BASE}/ward/{ward_id}/patients")
+        if resp.status_code != 200:
+            return {"error": f"Monitoring returned {resp.status_code}", "detail": resp.text[:500]}
+        data = resp.json()
+    finally:
+        if not _http_client:
+            await client.aclose()
+
+    patients = data.get("patients", [])
+
+    # Sort by NEWS score descending (highest risk first)
+    def _news_score(p: dict) -> float:
+        # Try multiple locations where NEWS score might live
+        score = p.get("news2_score") or p.get("news_score") or 0
+        vitals = p.get("latest_vitals") or p.get("vitals") or {}
+        if not score and isinstance(vitals, dict):
+            score = vitals.get("news2_score", vitals.get("news_score", 0))
+        return float(score) if score else 0.0
+
+    patients.sort(key=_news_score, reverse=True)
+
+    ranked = []
+    for p in patients:
+        score = _news_score(p)
+        if score >= 7:
+            risk_level = "high"
+        elif score >= 5:
+            risk_level = "medium"
+        else:
+            risk_level = "low"
+        ranked.append({
+            "patient_id": p.get("patient_id", ""),
+            "name": p.get("name", ""),
+            "bed": p.get("bed", ""),
+            "news2_score": score,
+            "risk_level": risk_level,
+            "latest_vitals": p.get("latest_vitals") or p.get("vitals") or {},
+        })
+
+    return {"ward_id": ward_id, "patients": ranked}
 
 
 _GATEWAY_TOOLS: dict[str, callable] = {
     "get_ward_rounds": _get_ward_rounds,
-    "resolve_bed": _resolve_bed,
-    "schedule_appointment": _schedule_appointment,
-    "set_reminder": _set_reminder,
+    "request_additional_tools": _request_additional_tools,
+    "get_care_plan": _get_care_plan,
+    "get_ward_risk_ranking": _get_ward_risk_ranking,
 }
 
 
@@ -244,17 +409,25 @@ _GATEWAY_TOOLS: dict[str, callable] = {
 # ---------------------------------------------------------------------------
 
 _pending: dict[str, dict] = {}
+_PENDING_MAX_SIZE = int(os.environ.get("PENDING_MAX_SIZE", "1000"))
 
 
-def get_tool_list() -> list[dict]:
-    """Return tool definitions for the agent/LLM."""
+def get_tool_list(domains: list[str] | None = None) -> list[dict]:
+    """Return tool definitions for the agent/LLM, optionally filtered by domains."""
+    allowed = set(get_tools_for_domains(domains)) if domains and _domain_config else None
     tools = []
     for name in TOOL_BACKENDS:
+        if allowed is not None and name not in allowed:
+            continue
         critical = is_critical(name)
         tools.append({"name": name, "critical": critical})
     # Gateway-level tools
-    tools.append({"name": "escalate", "critical": False})
+    if allowed is None or "escalate" in allowed:
+        tools.append({"name": "escalate", "critical": False})
+    _always_include = {"request_additional_tools"}
     for name in _GATEWAY_TOOLS:
+        if allowed is not None and name not in allowed and name not in _always_include:
+            continue
         critical = is_critical(name)
         tools.append({"name": name, "critical": critical})
     return tools
@@ -266,14 +439,20 @@ def get_tool_list() -> list[dict]:
 
 _TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_ward_rounds": "Get ward rounds report with vitals, meds, scans per patient",
-    "resolve_bed": "Resolve bed number to patient_id (bed_id: just the number e.g. '2' or 'BED2')",
+    "resolve_bed": "Resolve bed number to patient_id (e.g. '2' or 'BED2')",
+    "resolve_doctor": "Resolve doctor name to doctor ID",
     "schedule_appointment": "Schedule appointment for a patient with a doctor",
-    "set_reminder": "Set a timed reminder (fires via Telegram push)",
+    "set_reminder": "Set a timed reminder (fires via push notification)",
     "get_vitals": "Get latest vitals for a patient",
     "get_vitals_history": "Get vitals history for a patient",
     "get_vitals_trend": "Get vitals trend analysis with EWS scoring",
+    "get_patient_thresholds": "Get patient-specific vital sign thresholds (physician orders or hospital defaults)",
+    "update_patient_thresholds": "Update patient-specific vital sign thresholds (partial update, merged with existing)",
+    "get_active_alarms": "Get active clinical alarms for a patient (vitals breach, ventilator, infusion pump, etc.)",
+    "clear_alarm": "Clear/acknowledge a clinical alarm (requires cleared_by and reason)",
     "get_medications": "Get medications for a patient",
     "get_allergies": "Get allergies for a patient",
+    "get_conditions": "Get patient conditions and comorbidities",
     "get_lab_results": "Get lab results for a patient",
     "get_patient": "Get patient demographics",
     "escalate": "Escalate to a human clinician",
@@ -306,11 +485,55 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "order_diet": "Order diet for a patient (patient_id, diet_type e.g. veg/regular/diabetic, meal e.g. breakfast/lunch/dinner)",
     "request_ambulance": "Request ambulance/transport for a patient (patient_id, from_location, to_location)",
     "get_request_status": "Get status of a service request",
+    "request_additional_tools": (
+        "Request tools from additional domains when current tools are insufficient. "
+        "Available domains: core, vitals, labs, medications, ecg, radiology, orders, "
+        "emergency, services, scheduling, supplies, ward"
+    ),
+    "get_care_plan": "Get aggregated care plan for a patient (orders, appointments, reminders, pending labs)",
+    "get_ward_risk_ranking": "Get patients in a ward ranked by clinical risk (NEWS2 score)",
+}
+
+
+_HARDCODED_SCHEMAS: dict[str, dict] = {
+    "request_additional_tools": {
+        "type": "object",
+        "properties": {
+            "domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Domain names to add (e.g. ['radiology', 'ecg'])",
+            },
+        },
+        "required": ["domains"],
+    },
+    "get_care_plan": {
+        "type": "object",
+        "properties": {
+            "patient_id": {
+                "type": "string",
+                "description": "Patient identifier",
+            },
+        },
+        "required": ["patient_id"],
+    },
+    "get_ward_risk_ranking": {
+        "type": "object",
+        "properties": {
+            "ward_id": {
+                "type": "string",
+                "description": "Ward identifier",
+            },
+        },
+        "required": ["ward_id"],
+    },
 }
 
 
 def _schema_to_openai_params(tool_name: str) -> dict:
     """Convert tools.json params schema to OpenAI-style JSON Schema parameters."""
+    if tool_name in _HARDCODED_SCHEMAS:
+        return _HARDCODED_SCHEMAS[tool_name]
     schema = _TOOLS_CONFIG.get(tool_name, {}).get("params")
     if not schema:
         return {"type": "object", "properties": {}}
@@ -332,19 +555,24 @@ def _schema_to_openai_params(tool_name: str) -> dict:
     return result
 
 
-def build_tool_definitions() -> list[dict]:
-    """Build canonical tool definitions for native function calling."""
+def build_tool_definitions(domains: list[str] | None = None) -> list[dict]:
+    """Build canonical tool definitions for native function calling.
+
+    If domains provided and domain config loaded, filter to only those tools.
+    """
+    allowed = set(get_tools_for_domains(domains)) if domains and _domain_config else None
     defs = []
+    _always_include = {"request_additional_tools"}
     all_tool_names = list(TOOL_BACKENDS.keys()) + ["escalate"] + list(_GATEWAY_TOOLS.keys())
     for name in all_tool_names:
+        if allowed is not None and name not in allowed and name not in _always_include:
+            continue
         defs.append({
             "name": name,
             "description": _TOOL_DESCRIPTIONS.get(name, name),
             "parameters": _schema_to_openai_params(name),
         })
-    # Append analyzer tool definitions
-    import analyzers
-    defs.extend(analyzers.get_analyzer_tool_definitions())
+    # Skill tool definitions are added by the orchestrator via skill_registry.tool_definitions()
     return defs
 
 
@@ -381,24 +609,33 @@ async def call_tool(
     if validation_error:
         return {"error": f"Invalid parameters: {validation_error}"}
 
-    # Analyzer tools
-    if tool_name.startswith("analyze_"):
-        import analyzers
-        return await analyzers.run_analyzer_tool(tool_name, params, session)
-
     # Gateway-level: escalate
     if tool_name == "escalate":
         return await _escalate(params, session)
 
-    # Gateway-level: local tools (rounds, beds, scheduling, reminders)
+    # Gateway-level: local tools (rounds, domain expansion)
     if tool_name in _GATEWAY_TOOLS:
         return await _GATEWAY_TOOLS[tool_name](params, session)
+
+    # Inject session context for reminder dispatch (backend needs session_id/channel)
+    if tool_name == "set_reminder":
+        params = {**params, "session_id": session.id, "channel": session.channel}
 
     if tool_name not in TOOL_BACKENDS:
         return {"error": f"Unknown tool: {tool_name}"}
 
     if is_critical(tool_name):
+        if len(_pending) >= _PENDING_MAX_SIZE:
+            cleanup_expired_confirmations()
+        if len(_pending) >= _PENDING_MAX_SIZE:
+            return {"error": "Too many pending confirmations. Please try again later."}
         cid = str(uuid.uuid4())
+        params_hash = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
+        sig = hmac.new(
+            _CONFIRM_SECRET,
+            f"{cid}:{tool_name}:{params_hash}:{session.user_id}".encode(),
+            "sha256",
+        ).hexdigest()
         _pending[cid] = {
             "tool_name": tool_name,
             "params": params,
@@ -406,6 +643,9 @@ async def call_tool(
             "tenant_id": session.tenant_id,
             "user_id": session.user_id,
             "channel": session.channel,
+            "created_at": time.monotonic(),
+            "client_id": getattr(session, "_client_id", ""),
+            "signature": sig,
         }
         await log_action(
             tenant_id=session.tenant_id,
@@ -435,12 +675,33 @@ def _strip_client_hints(params: dict) -> dict:
     return {k: v for k, v in params.items() if k not in _CLIENT_HINT_KEYS}
 
 
-async def confirm_tool(confirmation_id: str, session: Any) -> dict[str, Any]:
+async def confirm_tool(confirmation_id: str, session: Any, client_id: str = "") -> dict[str, Any]:
     """Execute a pending critical tool after confirmation."""
-    entry = _pending.pop(confirmation_id, None)
+    entry = _pending.get(confirmation_id)
     if entry is None:
         return {"error": "Confirmation not found or already executed"}
 
+    # TTL check
+    age = time.monotonic() - entry["created_at"]
+    if age > CONFIRMATION_TTL_SECONDS:
+        _pending.pop(confirmation_id, None)
+        return {"error": "Confirmation expired"}
+
+    # Client binding check
+    if client_id and entry.get("client_id") and client_id != entry["client_id"]:
+        return {"error": "Client mismatch"}
+
+    # HMAC signature verification
+    params_hash = hashlib.sha256(json.dumps(entry["params"], sort_keys=True).encode()).hexdigest()[:16]
+    expected_sig = hmac.new(
+        _CONFIRM_SECRET,
+        f"{confirmation_id}:{entry['tool_name']}:{params_hash}:{entry['user_id']}".encode(),
+        "sha256",
+    ).hexdigest()
+    if not hmac.compare_digest(entry.get("signature", ""), expected_sig):
+        return {"error": "Signature verification failed"}
+
+    _pending.pop(confirmation_id)
     result = await _dispatch(entry["tool_name"], entry["params"], session)
     await log_action(
         tenant_id=entry["tenant_id"],
@@ -454,6 +715,16 @@ async def confirm_tool(confirmation_id: str, session: Any) -> dict[str, Any]:
         confirmation_id=confirmation_id,
     )
     return result
+
+
+def cleanup_expired_confirmations() -> int:
+    """Remove pending confirmations older than TTL. Returns count removed."""
+    now = time.monotonic()
+    expired = [cid for cid, entry in _pending.items()
+               if now - entry.get("created_at", 0) > CONFIRMATION_TTL_SECONDS]
+    for cid in expired:
+        _pending.pop(cid, None)
+    return len(expired)
 
 
 # ---------------------------------------------------------------------------
@@ -472,28 +743,54 @@ def _build_url(base: str, path_template: str, params: dict) -> tuple[str, dict]:
     return f"{base}{path}", remaining
 
 
+def _trace_headers() -> dict[str, str]:
+    """Build X-Request-ID header for downstream tracing."""
+    try:
+        from main import request_id_var
+        rid = request_id_var.get("")
+        if rid:
+            return {"X-Request-ID": rid}
+    except (ImportError, LookupError):
+        pass
+    return {}
+
+
 async def _dispatch(tool_name: str, params: dict, session: Any) -> dict:
     """HTTP dispatch to the appropriate synthetic backend."""
+    import time as _time
+    import metrics as _metrics
+    _t0 = _time.time()
     base, method, path_template = TOOL_BACKENDS[tool_name]
     url, remaining = _build_url(base, path_template, params)
     logger.info("[%s] dispatch %s %s", session.id, method, url)
-    # Orthanc (radiology) requires basic auth
-    auth = ("orthanc", "orthanc") if base == RADIOLOGY_BASE else None
+    auth = _orthanc_auth() if base == RADIOLOGY_BASE else None
+    headers = _trace_headers()
+    client = _http_client or httpx.AsyncClient(timeout=15.0)
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            if method == "GET":
-                resp = await client.get(url, params=remaining if remaining else None, auth=auth)
-            else:
-                resp = await client.post(url, json=remaining if remaining else params, auth=auth)
-            resp.raise_for_status()
-            logger.info("[%s] dispatch %s -> %d", session.id, tool_name, resp.status_code)
-            return resp.json()
+        if method == "GET":
+            resp = await client.get(url, params=remaining if remaining else None, auth=auth, headers=headers)
+        elif method == "PUT":
+            resp = await client.put(url, json=remaining if remaining else params, auth=auth, headers=headers)
+        else:
+            resp = await client.post(url, json=remaining if remaining else params, auth=auth, headers=headers)
+        resp.raise_for_status()
+        logger.info("[%s] dispatch %s -> %d", session.id, tool_name, resp.status_code)
+        _metrics.TOOL_CALLS.labels(tool_name=tool_name, status="ok").inc()
+        _metrics.TOOL_DURATION.labels(tool_name=tool_name).observe(_time.time() - _t0)
+        return resp.json()
     except httpx.HTTPStatusError as exc:
         logger.warning("[%s] dispatch %s -> HTTP %d", session.id, tool_name, exc.response.status_code)
+        _metrics.TOOL_CALLS.labels(tool_name=tool_name, status="error").inc()
+        _metrics.TOOL_DURATION.labels(tool_name=tool_name).observe(_time.time() - _t0)
         return {"error": f"Backend returned {exc.response.status_code}", "detail": exc.response.text[:500]}
     except Exception as exc:
         logger.error("[%s] dispatch %s -> unreachable: %s", session.id, tool_name, exc)
+        _metrics.TOOL_CALLS.labels(tool_name=tool_name, status="error").inc()
+        _metrics.TOOL_DURATION.labels(tool_name=tool_name).observe(_time.time() - _t0)
         return {"error": f"Backend unreachable: {exc}"}
+    finally:
+        if not _http_client:
+            await client.aclose()
 
 
 # ---------------------------------------------------------------------------
